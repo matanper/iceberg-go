@@ -91,6 +91,25 @@ const (
 	WriteTargetFileSizeBytesKey     = "write.target-file-size-bytes"
 	WriteTargetFileSizeBytesDefault = 512 * 1024 * 1024 // 512 MB
 
+	// WriteVariantShreddingPathsKey lists the variant subfields to physically
+	// shred into separate Parquet columns at write time. The value is a
+	// comma-separated list of "<column>:<path>:<type>" entries, where:
+	//   - <column>   is the iceberg field name carrying the variant
+	//   - <path>     is a "$.field" JSON-path locator (top-level fields only in v1)
+	//   - <type>     is one of: boolean, int, long, float, double, string, binary
+	//
+	// Example: "payload:$.lat:double,payload:$.lng:double".
+	//
+	// When unset (the default), variants are written using the unshredded
+	// metadata+value layout. When set, the writer extracts the declared paths
+	// into per-row typed_value subfields per the Parquet Variant Shredding
+	// spec, leaving the residual variant in `value`.
+	//
+	// This mirrors apache/iceberg's write.parquet.shred-variants property
+	// flag, but takes explicit paths and types instead of running a buffered
+	// inference analyzer. See apache/iceberg-go#987.
+	WriteVariantShreddingPathsKey = "write.variant.shredding-paths"
+
 	MinSnapshotsToKeepKey     = "min-snapshots-to-keep"
 	MinSnapshotsToKeepDefault = math.MaxInt
 

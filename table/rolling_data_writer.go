@@ -55,6 +55,12 @@ type writerFactory struct {
 	content          iceberg.ManifestEntryContent
 	equalityFieldIDs []int
 	sortOrderID      int
+	// shreddingCfg is parsed from the WriteVariantShreddingPathsKey table
+	// property. When non-empty, the factory's fileSchema and arrowSchema
+	// already reflect the shredded variant layout, and incoming record
+	// batches are reshaped via internal.ShredRecordBatch before being
+	// handed to the Parquet writer.
+	shreddingCfg *tblutils.ShreddingConfig
 
 	writers               sync.Map
 	partitionLocProviders sync.Map
@@ -120,6 +126,17 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		fileSchema = sanitized
 	}
 
+	shreddingCfg, err := tblutils.ParseShreddingPaths(
+		iceberg.Properties(meta.props).Get(WriteVariantShreddingPathsKey, ""))
+	if err != nil {
+		stopCount()
+
+		return nil, fmt.Errorf("%w: %w", ErrInvalidOperation, err)
+	}
+	if !shreddingCfg.Empty() {
+		fileSchema = tblutils.ApplyShreddingToSchema(fileSchema, shreddingCfg)
+	}
+
 	fileFormat, err := iceberg.FileFormatFromString(
 		iceberg.Properties(meta.props).Get(WriteFormatDefaultKey, WriteFormatDefaultDefault))
 	if err != nil {
@@ -161,6 +178,7 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		nextCount:      nextCount,
 		stopCount:      stopCount,
 		sortOrderID:    meta.defaultSortOrderID,
+		shreddingCfg:   shreddingCfg,
 	}
 	for _, apply := range opts {
 		apply(f)
@@ -349,6 +367,18 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 			r.sendError(err)
 
 			return
+		}
+
+		if !r.factory.shreddingCfg.Empty() {
+			shredded, sErr := tblutils.ShredRecordBatch(converted, r.factory.shreddingCfg, nil)
+			converted.Release()
+			if sErr != nil {
+				record.Release()
+				r.sendError(sErr)
+
+				return
+			}
+			converted = shredded
 		}
 
 		err = currentWriter.Write(converted)
