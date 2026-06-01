@@ -80,19 +80,61 @@ func TestShreddedVariantReadsApacheParquetTestingFixtures(t *testing.T) {
 	}
 }
 
-// TestShreddedVariantWriteRoundTripsObjectFixture takes case-046's
-// canonical variant ({a: null, b: ""}), shreds it through
-// iceberg-go's writer with $.a:string and $.b:string, reads the
-// produced Parquet back via pqarrow, and asserts the reconstructed
-// variant equals the original. This proves the write-side path
-// produces Parquet that is compatible with the same readers Java and
-// pyiceberg rely on.
-func TestShreddedVariantWriteRoundTripsObjectFixture(t *testing.T) {
-	ctx := context.Background()
-	mem := memory.DefaultAllocator
+// TestShreddedVariantWriteRoundTripsCanonicalFixtures shreds each
+// vendored apache/parquet-testing variant through iceberg-go's
+// writer, reads the produced Parquet back via pqarrow, and asserts
+// the reconstructed variant matches the original. The shredding
+// spec passed for each case matches the shape of the Java-produced
+// fixture, so iceberg-go's output is structurally equivalent to
+// what Spark / Iceberg-java would emit for the same value.
+func TestShreddedVariantWriteRoundTripsCanonicalFixtures(t *testing.T) {
+	cases := []struct {
+		name        string
+		variantFile string
+		// shreddingPaths is the WriteVariantShreddingPathsKey property
+		// value used when writing this case. It must match the
+		// physical layout of the Java fixture so a Java reader of our
+		// output would see the same column tree.
+		shreddingPaths string
+	}{
+		{
+			name:           "top-level boolean (case-004)",
+			variantFile:    "case-004_row-0.variant.bin",
+			shreddingPaths: "var:$:boolean",
+		},
+		{
+			name:           "top-level int (case-006)",
+			variantFile:    "case-006_row-0.variant.bin",
+			shreddingPaths: "var:$:int",
+		},
+		{
+			name:           "top-level long (case-012)",
+			variantFile:    "case-012_row-0.variant.bin",
+			shreddingPaths: "var:$:long",
+		},
+		{
+			name:           "object with null + empty string (case-046)",
+			variantFile:    "case-046_row-0.variant.bin",
+			shreddingPaths: "var:$.a:string, var:$.b:string",
+		},
+	}
 
-	source := readVariantBin(t,
-		filepath.Join("internal", "testdata", "shredded_variant", "case-046_row-0.variant.bin"))
+	ctx := context.Background()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := readVariantBin(t,
+				filepath.Join("internal", "testdata", "shredded_variant", tc.variantFile))
+			roundTripVariant(t, ctx, source, tc.shreddingPaths)
+		})
+	}
+}
+
+// roundTripVariant writes source through the shredded writer with
+// the given paths spec, reads back via pqarrow, and asserts
+// structural equality.
+func roundTripVariant(t *testing.T, ctx context.Context, source variant.Value, shreddingPaths string) {
+	t.Helper()
+	mem := memory.DefaultAllocator
 
 	icebergSchema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
@@ -101,7 +143,7 @@ func TestShreddedVariantWriteRoundTripsObjectFixture(t *testing.T) {
 	loc := filepath.ToSlash(t.TempDir())
 	props := iceberg.Properties{
 		"format-version":              "3",
-		WriteVariantShreddingPathsKey: "var:$.a:string, var:$.b:string",
+		WriteVariantShreddingPathsKey: shreddingPaths,
 	}
 	meta, err := NewMetadata(icebergSchema, iceberg.UnpartitionedSpec, UnsortedSortOrder, loc, props)
 	require.NoError(t, err)
@@ -125,7 +167,6 @@ func TestShreddedVariantWriteRoundTripsObjectFixture(t *testing.T) {
 
 	got, err := produced.Value(0)
 	require.NoError(t, err)
-
 	assertVariantStructurallyEqual(t, source, got)
 }
 

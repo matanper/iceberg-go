@@ -95,11 +95,17 @@ const (
 	// shred into separate Parquet columns at write time. The value is a
 	// comma-separated list of "<column>:<path>:<type>" entries, where:
 	//   - <column>   is the iceberg field name carrying the variant
-	//   - <path>     is a "$.a.b.c" JSON-path locator (nested objects supported;
-	//                array indexing is not)
+	//   - <path>     is a JSON-path locator. Top-level shredding uses "$"
+	//                (the variant payload itself is the typed value);
+	//                nested object access uses "$.a.b"; array elements use
+	//                "$.tags[]" (empty brackets — positional indexing
+	//                like "[0]" is rejected per the Parquet spec)
 	//   - <type>     is one of: boolean, int, long, float, double, string, binary
 	//
-	// Example: "payload:$.lat:double, payload:$.user.email:string".
+	// Examples:
+	//   "payload:$.lat:double, payload:$.user.email:string"
+	//   "tags:$.tags[]:string"
+	//   "value:$:double"   // top-level: the variant itself is a double
 	//
 	// When unset (the default), variants are written using the unshredded
 	// metadata+value layout. When set, the writer extracts the declared paths

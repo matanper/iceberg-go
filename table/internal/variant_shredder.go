@@ -33,12 +33,19 @@ import (
 
 // ShreddingPath declares one path-to-leaf in a shredding spec.
 //
-// Segments are the JSON-path field names walked from the variant root
-// down to the leaf. "$.user.email" parses to ["user", "email"]; the
-// top-level path "$.lat" parses to ["lat"]. Array index access ($.foo[0])
-// and root-as-array shredding are not supported yet — the parser
-// surfaces them as explicit errors so callers don't silently get a
-// no-op.
+// Segments are the navigation steps walked from the variant root down
+// to the leaf. Field names appear verbatim; the "[]" token denotes
+// "every element of the surrounding array." So:
+//
+//	"$.user.email"   -> ["user", "email"]
+//	"$.tags[]"       -> ["tags", "[]"]
+//	"$.events[].ts"  -> ["events", "[]", "ts"]
+//	"$"              -> []           // top-level: the variant itself is the leaf
+//
+// Positional indexing ($.foo[0]) is rejected at parse time — per the
+// Parquet shredding spec, individual array positions are not separately
+// addressable; the whole list is shredded as a single typed_value
+// column with one element shape.
 type ShreddingPath struct {
 	Segments []string
 	// Type is the Arrow primitive type extracted at the leaf when the
@@ -48,9 +55,9 @@ type ShreddingPath struct {
 	Type arrow.DataType
 }
 
-// Path returns the dotted "$.a.b" form of the declaration.
+// Path returns the dotted "$.a.b[]" form of the declaration.
 func (p ShreddingPath) Path() string {
-	return "$." + strings.Join(p.Segments, ".")
+	return pathString(p.Segments)
 }
 
 // ShreddingSchema is the parsed shredding spec for one variant column.
@@ -131,16 +138,22 @@ var shreddingTypeAliases = map[string]arrow.DataType{
 // triples; whitespace around entries is ignored. An empty string yields
 // an empty config (shredding disabled).
 //
-// Example: "payload:$.lat:double, payload:$.user.email:string".
+// Examples:
+//
+//	"payload:$.lat:double, payload:$.user.email:string"
+//	"tags:$.tags[]:string"     // shred every element as a string
+//	"value:$:double"            // top-level: the variant itself is the typed value
 //
 // Conflicts and ambiguities are rejected at parse time:
+//   - Top-level shredding (path "$") is exclusive — it cannot coexist
+//     with any other path on the same column.
 //   - Two paths on the same column where one is a strict prefix of the
 //     other (e.g. "$.user" and "$.user.email") would force the writer
 //     to both extract user as a typed value AND shred sub-fields of
 //     user — incompatible per the Parquet spec.
 //   - Duplicate paths.
 //   - Empty segments ("$..").
-//   - Array indexing ("$.foo[0]").
+//   - Positional array indexing ("$.foo[0]") — use "[]" instead.
 func ParseShreddingPaths(s string) (*ShreddingConfig, error) {
 	cfg := &ShreddingConfig{byColumn: map[string]*ShreddingSchema{}}
 	s = strings.TrimSpace(s)
@@ -184,10 +197,24 @@ func ParseShreddingPaths(s string) (*ShreddingConfig, error) {
 	return cfg, nil
 }
 
-// parsePathSegments splits "$.a.b.c" into ["a", "b", "c"]. Returns an
-// error for paths missing the "$." prefix, paths with empty segments,
-// or paths that use array indexing.
+// arrayMarker is the segment token used inside a parsed path to
+// denote "step into each element of the surrounding array". Path
+// "$.tags[].name" parses to segments ["tags", "[]", "name"]. The
+// marker is also used as the single child key under an array
+// pathTree node so the tree shape uniformly represents arrays.
+const arrayMarker = "[]"
+
+// parsePathSegments converts a "$.a.b[].c" path string into the
+// segment slice ["a", "b", "[]", "c"]. The lone "$" path is allowed
+// and yields an empty slice, denoting top-level shredding (the
+// variant payload itself is the shred target). Returns an error for
+// paths missing the "$" prefix, paths with empty field names, or
+// positional array indexing (e.g. "[0]") which the spec does not
+// support.
 func parsePathSegments(path string) ([]string, error) {
+	if path == "$" {
+		return []string{}, nil
+	}
 	if !strings.HasPrefix(path, "$.") {
 		return nil, fmt.Errorf("path must start with %q, got %q", "$.", path)
 	}
@@ -195,10 +222,45 @@ func parsePathSegments(path string) ([]string, error) {
 	if rest == "" {
 		return nil, fmt.Errorf("empty path %q", path)
 	}
-	if strings.ContainsAny(rest, "[]") {
-		return nil, fmt.Errorf("array indexing not supported in shredding paths, got %q", path)
+	segments := make([]string, 0)
+	for rest != "" {
+		// Pull off the field name up to the next . or [.
+		boundary := strings.IndexAny(rest, ".[")
+		if boundary == -1 {
+			segments = append(segments, rest)
+
+			break
+		}
+		if boundary == 0 {
+			return nil, fmt.Errorf("empty segment in path %q", path)
+		}
+		segments = append(segments, rest[:boundary])
+		switch rest[boundary] {
+		case '.':
+			rest = rest[boundary+1:]
+			if rest == "" {
+				return nil, fmt.Errorf("trailing dot in path %q", path)
+			}
+		case '[':
+			if !strings.HasPrefix(rest[boundary:], "[]") {
+				return nil, fmt.Errorf("positional array indexing not supported (use []) in path %q", path)
+			}
+			segments = append(segments, arrayMarker)
+			rest = rest[boundary+2:]
+			if rest == "" {
+				break
+			}
+			if rest[0] != '.' && rest[0] != '[' {
+				return nil, fmt.Errorf("expected '.' or '[' after %q in path %q", arrayMarker, path)
+			}
+			if rest[0] == '.' {
+				rest = rest[1:]
+				if rest == "" {
+					return nil, fmt.Errorf("trailing dot in path %q", path)
+				}
+			}
+		}
 	}
-	segments := strings.Split(rest, ".")
 	for _, seg := range segments {
 		if seg == "" {
 			return nil, fmt.Errorf("empty segment in path %q", path)
@@ -208,33 +270,66 @@ func parsePathSegments(path string) ([]string, error) {
 	return segments, nil
 }
 
-// checkPathConflict rejects a new path that would be a strict prefix
-// of, or strictly extend, an existing path on the same column.
+// checkPathConflict rejects a new path that would collide with an
+// existing one on the same column. Collisions include duplicate
+// paths and prefix relationships that would force the writer to
+// treat the same node as both a leaf and an interior.
+//
+// Top-level shredding (empty segments) is exclusive: it cannot
+// coexist with any other path on the column.
 //
 // Example collisions:
 //
 //	existing "$.user"          new "$.user.email"   -> reject
 //	existing "$.user.email"    new "$.user"         -> reject
-//	existing "$.user.email"    new "$.user.email"   -> reject (duplicate)
+//	existing "$"               new anything         -> reject
 //
 // Independent paths under a common interior key are fine:
 //
 //	"$.user.email" + "$.user.id" -> both allowed (independent leaves).
 func checkPathConflict(existing []ShreddingPath, candidate []string) error {
+	candidatePath := pathString(candidate)
 	for _, p := range existing {
+		existingPath := pathString(p.Segments)
 		switch {
 		case segmentsEqual(p.Segments, candidate):
-			return fmt.Errorf("duplicate path %q", "$."+strings.Join(candidate, "."))
+			return fmt.Errorf("duplicate path %q", candidatePath)
+		case len(p.Segments) == 0:
+			return fmt.Errorf("path %q conflicts with top-level shredding %q",
+				candidatePath, existingPath)
+		case len(candidate) == 0:
+			return fmt.Errorf("top-level path %q conflicts with already-declared path %q",
+				candidatePath, existingPath)
 		case isStrictPrefix(p.Segments, candidate):
 			return fmt.Errorf("path %q would shred fields under already-leaf path %q",
-				"$."+strings.Join(candidate, "."), "$."+strings.Join(p.Segments, "."))
+				candidatePath, existingPath)
 		case isStrictPrefix(candidate, p.Segments):
 			return fmt.Errorf("path %q is a prefix of already-declared path %q",
-				"$."+strings.Join(candidate, "."), "$."+strings.Join(p.Segments, "."))
+				candidatePath, existingPath)
 		}
 	}
 
 	return nil
+}
+
+// pathString rebuilds the "$.a[].b" form from a parsed segments
+// slice for use in error messages.
+func pathString(segments []string) string {
+	if len(segments) == 0 {
+		return "$"
+	}
+	var b strings.Builder
+	b.WriteByte('$')
+	for _, seg := range segments {
+		if seg == arrayMarker {
+			b.WriteString("[]")
+		} else {
+			b.WriteByte('.')
+			b.WriteString(seg)
+		}
+	}
+
+	return b.String()
 }
 
 func segmentsEqual(a, b []string) bool {
@@ -264,11 +359,16 @@ func isStrictPrefix(a, b []string) bool {
 	return true
 }
 
-// pathTree is the recursive representation of a ShreddingSchema. At
-// every node exactly one of leafType or children is set:
-//   - leafType != nil  -> primitive shred target. No children.
-//   - children != nil  -> interior object node. typed_value at this
-//     level is a struct of the children's typed_value types.
+// pathTree is the recursive representation of a ShreddingSchema. A
+// node is exactly one of:
+//   - leaf:   leafType != nil. The variant at this position is shred
+//     as a primitive of the declared type.
+//   - struct: children != nil, no arrayMarker child. The variant at
+//     this position is shred as an object whose declared sub-keys
+//     each carry their own pathTree.
+//   - array:  children has exactly one entry under the arrayMarker
+//     key. The variant at this position is shred as a list whose
+//     element shape is the marker's subtree.
 //
 // childOrder preserves the user-declared order so the resulting Arrow
 // struct fields are deterministic.
@@ -278,8 +378,27 @@ type pathTree struct {
 	childOrder []string
 }
 
+func (n *pathTree) isLeaf() bool { return n != nil && n.leafType != nil }
+func (n *pathTree) isArray() bool {
+	return n != nil && len(n.childOrder) == 1 && n.childOrder[0] == arrayMarker
+}
+
+func (n *pathTree) isStruct() bool {
+	return n != nil && !n.isLeaf() && !n.isArray() && len(n.childOrder) > 0
+}
+
+// arrayElem returns the element subtree of an array node, or nil if
+// the node is not an array.
+func (n *pathTree) arrayElem() *pathTree {
+	if !n.isArray() {
+		return nil
+	}
+
+	return n.children[arrayMarker]
+}
+
 func buildPathTree(paths []ShreddingPath) *pathTree {
-	root := &pathTree{children: map[string]*pathTree{}}
+	root := &pathTree{}
 	for _, p := range paths {
 		insertPath(root, p.Segments, p.Type)
 	}
@@ -289,28 +408,20 @@ func buildPathTree(paths []ShreddingPath) *pathTree {
 
 func insertPath(node *pathTree, segments []string, leafType arrow.DataType) {
 	if len(segments) == 0 {
-		// Should never happen — parser rejects empty paths — but
-		// guard anyway so a programming error doesn't silently
-		// produce a broken tree.
-		panic("variant shredding: empty path in tree insert")
-	}
-	head, tail := segments[0], segments[1:]
-	child, ok := node.children[head]
-	if !ok {
-		child = &pathTree{}
-		if node.children == nil {
-			node.children = map[string]*pathTree{}
-		}
-		node.children[head] = child
-		node.childOrder = append(node.childOrder, head)
-	}
-	if len(tail) == 0 {
-		child.leafType = leafType
+		// Top-level / leaf insertion.
+		node.leafType = leafType
 
 		return
 	}
-	if child.children == nil {
-		child.children = map[string]*pathTree{}
+	head, tail := segments[0], segments[1:]
+	if node.children == nil {
+		node.children = map[string]*pathTree{}
+	}
+	child, ok := node.children[head]
+	if !ok {
+		child = &pathTree{}
+		node.children[head] = child
+		node.childOrder = append(node.childOrder, head)
 	}
 	insertPath(child, tail, leafType)
 }
@@ -331,8 +442,11 @@ func TypedValueArrowType(schema *ShreddingSchema) arrow.DataType {
 }
 
 func treeArrowType(node *pathTree) arrow.DataType {
-	if node.leafType != nil {
+	switch {
+	case node.isLeaf():
 		return node.leafType
+	case node.isArray():
+		return arrow.ListOf(treeArrowType(node.arrayElem()))
 	}
 	fields := make([]arrow.Field, 0, len(node.childOrder))
 	for _, name := range node.childOrder {
@@ -343,39 +457,53 @@ func treeArrowType(node *pathTree) arrow.DataType {
 	return arrow.StructOf(fields...)
 }
 
-// ShreddedField is the per-row, per-path result of ShredVariant. At any
-// given path, at most one of {Typed, Residual, Object} is meaningful;
-// Present says whether the path was present in the input variant at
-// all.
+// ShreddedField is the per-row, per-path result of ShredVariant. At
+// any given node at most one of {Typed, Residual, Object, Array} is
+// meaningful; Present says whether the path was present in the
+// surrounding context at all.
 //
-// Leaf node, declared type matched:    {Typed: extracted, Present: true}
-// Leaf node, type mismatch / null:     {Residual: bytes,  Present: true}
-// Leaf or interior node, absent:       {Present: false}
-// Interior node, input is an object:   {Object: <sub-result>, Present: true}
-// Interior node, input is non-object:  {Residual: bytes,  Present: true}
+//	Leaf,     type matched:    {Typed: <extracted>,    Present: true}
+//	Leaf,     type mismatch:   {Residual: <raw>,       Present: true}
+//	Struct,   input is object: {Object: <sub-result>,  Present: true}
+//	Struct,   non-object:      {Residual: <raw>,       Present: true}
+//	Array,    input is array:  {Array: <sub-result>,   Present: true}
+//	Array,    non-array:       {Residual: <raw>,       Present: true}
+//	Absent (any kind):         {Present: false}
 type ShreddedField struct {
 	Typed    any
 	Residual []byte
 	Object   *ShreddedObject
+	Array    *ShreddedArray
 	Present  bool
 }
 
-// ShreddedObject is the per-row result at an interior object node.
-// Fields are ordered to match the pathTree's childOrder.
-// ResidualValue holds the variant bytes of unshredded sub-fields at
-// this level (nil when nothing remains).
+// ShreddedObject is the per-row result at a struct node. Fields are
+// ordered to match the pathTree's childOrder. ResidualValue holds
+// the variant bytes of unshredded sub-fields at this level (nil
+// when nothing remains).
 type ShreddedObject struct {
 	Fields        []ShreddedField
 	ResidualValue []byte
 }
 
+// ShreddedArray is the per-row result at an array node. Elements
+// holds one ShreddedField per array element, in source order.
+// Variant arrays don't have a per-position residual the way objects
+// do (you can't drop elements without shifting indices), so when an
+// element's variant value doesn't match the declared element shape
+// the element's own ShreddedField carries the raw bytes in Residual.
+type ShreddedArray struct {
+	Elements []ShreddedField
+}
+
 // ShredResult is the per-row output of ShredVariant for a single
-// variant column. Root.Fields aligns with the root pathTree's child
-// order, and Root.ResidualValue is the top-level residual variant
-// bytes (or the verbatim input bytes when the input is not an object).
+// variant column. Root represents the entire variant; what's set on
+// Root depends on the schema's top-level node kind (leaf for
+// top-level primitive shredding, Object for object shredding, Array
+// for top-level array shredding).
 type ShredResult struct {
 	Metadata []byte
-	Root     ShreddedObject
+	Root     ShreddedField
 }
 
 // ShredVariant extracts the configured paths from a variant value,
@@ -385,14 +513,14 @@ type ShredResult struct {
 //
 // The Parquet spec rules implemented here:
 //
-//  1. Either `value` (residual) or `typed_value` is non-null at a
-//     leaf, never both.
-//  2. At an object node, BOTH `value` and `typed_value` may be
+//  1. At a leaf, either `value` (residual) or `typed_value` is
+//     non-null, never both.
+//  2. At a struct node, BOTH `value` and `typed_value` may be
 //     populated: `typed_value` carries the declared shredded
 //     sub-fields, `value` carries any sub-fields not declared.
-//  3. When the variant at an interior node is *not* an object, the
-//     typed_value sub-struct is null and the raw variant bytes go
-//     into `value`.
+//  3. At an array node, `typed_value` is a Parquet 3-level LIST and
+//     `value` is null when the payload is an array; non-array
+//     payloads fall back to per-path residual storage.
 //  4. Type mismatch at a leaf (declared double, payload is a string
 //     or null) is not an error — the raw variant bytes are stored in
 //     `value` and `typed_value` is left null, so a reader can still
@@ -406,20 +534,18 @@ func ShredVariant(v variant.Value, schema *ShreddingSchema) (ShredResult, error)
 		return ShredResult{}, errors.New("variant shredding: empty schema")
 	}
 
-	res := ShredResult{Metadata: v.Metadata().Bytes()}
-	obj, err := shredObject(v, tree)
+	root, err := shredAt(v, tree)
 	if err != nil {
 		return ShredResult{}, err
 	}
-	res.Root = obj
 
-	return res, nil
+	return ShredResult{Metadata: v.Metadata().Bytes(), Root: root}, nil
 }
 
-// shredObject processes a variant value against an object-shaped
-// pathTree node and returns the per-row result. If the variant is not
-// an Object, every declared child is reported absent and the verbatim
-// input bytes become the residual at this level.
+// shredObject processes a variant value against a struct-shaped
+// pathTree node and returns the per-row result. If the variant is
+// not an Object, every declared child is reported absent and the
+// verbatim input bytes become the residual at this level.
 func shredObject(v variant.Value, node *pathTree) (ShreddedObject, error) {
 	out := ShreddedObject{Fields: make([]ShreddedField, len(node.childOrder))}
 	if v.Type() != variant.Object {
@@ -429,14 +555,11 @@ func shredObject(v variant.Value, node *pathTree) (ShreddedObject, error) {
 	}
 	objValue, ok := v.Value().(variant.ObjectValue)
 	if !ok {
-		// Defensive — should not happen given variant.Type() == Object.
 		out.ResidualValue = v.Bytes()
 
 		return out, nil
 	}
 
-	// Index source object's fields by key; track what got matched so
-	// we can compute the residual from what's left.
 	type residualField struct {
 		key   string
 		bytes []byte
@@ -458,13 +581,10 @@ func shredObject(v variant.Value, node *pathTree) (ShreddedObject, error) {
 		out.Fields[idx] = shredded
 	}
 
-	// Residual rule: when every input field was claimed by a shredded
-	// path AND something matched, leave ResidualValue nil so the
-	// writer encodes the outer `value` column as null. Empty objects
-	// (matched == 0, no residual fields) get the verbatim input bytes
-	// so reconstruction round-trips correctly.
 	if len(residualFields) == 0 {
 		if matched == 0 {
+			// Empty object input: round-trip the verbatim bytes so
+			// reconstruction yields an empty object rather than nil.
 			out.ResidualValue = v.Bytes()
 		}
 
@@ -492,33 +612,68 @@ func shredObject(v variant.Value, node *pathTree) (ShreddedObject, error) {
 	return out, nil
 }
 
-// shredAt processes a variant value against any pathTree node (leaf
-// or interior). Always returns Present: true — the caller filters out
-// absent paths before invoking this.
+// shredArray processes a variant value against an array-shaped
+// pathTree node. The element shape (a single child under the array
+// marker) is applied to every variant array element. Non-array
+// payloads short-circuit to per-path residual storage at the caller.
+func shredArray(v variant.Value, node *pathTree) (ShreddedArray, error) {
+	arrValue, ok := v.Value().(variant.ArrayValue)
+	if !ok {
+		// Variant.Type() said Array but the cast failed; defensive.
+		return ShreddedArray{}, fmt.Errorf("variant shredding: array node received non-array payload (type %v)", v.Type())
+	}
+	elemNode := node.arrayElem()
+	out := ShreddedArray{Elements: make([]ShreddedField, 0, arrValue.Len())}
+	for elem := range arrValue.Values() {
+		f, err := shredAt(elem, elemNode)
+		if err != nil {
+			return ShreddedArray{}, fmt.Errorf("element %d: %w", len(out.Elements), err)
+		}
+		out.Elements = append(out.Elements, f)
+	}
+
+	return out, nil
+}
+
+// shredAt processes a variant value against any pathTree node (leaf,
+// struct, or array). Always returns Present: true — callers filter
+// out absent paths before invoking this.
 //
-// At an interior node, a non-object payload short-circuits to per-path
-// residual storage (Object left nil) so the writer encodes the entire
-// typed_value sub-tree as null while preserving the raw variant bytes
-// in `value`. Only when the payload is actually an object do we
-// recurse and surface a ShreddedObject.
+// When the payload kind doesn't match the node kind (e.g. a struct
+// node receives a non-object) the function short-circuits to
+// per-path residual storage so the writer encodes the entire
+// typed_value sub-tree as null while preserving the raw variant
+// bytes in `value`.
 func shredAt(v variant.Value, node *pathTree) (ShreddedField, error) {
-	if node.leafType != nil {
+	switch {
+	case node.isLeaf():
 		typed, ok := extractTyped(v, node.leafType)
 		if ok {
 			return ShreddedField{Typed: typed, Present: true}, nil
 		}
 
 		return ShreddedField{Residual: v.Bytes(), Present: true}, nil
-	}
-	if v.Type() != variant.Object {
-		return ShreddedField{Residual: v.Bytes(), Present: true}, nil
-	}
-	obj, err := shredObject(v, node)
-	if err != nil {
-		return ShreddedField{}, err
-	}
+	case node.isArray():
+		if v.Type() != variant.Array {
+			return ShreddedField{Residual: v.Bytes(), Present: true}, nil
+		}
+		arr, err := shredArray(v, node)
+		if err != nil {
+			return ShreddedField{}, err
+		}
 
-	return ShreddedField{Object: &obj, Present: true}, nil
+		return ShreddedField{Array: &arr, Present: true}, nil
+	default:
+		if v.Type() != variant.Object {
+			return ShreddedField{Residual: v.Bytes(), Present: true}, nil
+		}
+		obj, err := shredObject(v, node)
+		if err != nil {
+			return ShreddedField{}, err
+		}
+
+		return ShreddedField{Object: &obj, Present: true}, nil
+	}
 }
 
 // childIndex returns the index of `key` in node.childOrder, or
@@ -644,12 +799,8 @@ func ShreddingConfigFromSchema(s *iceberg.Schema) *ShreddingConfig {
 		if shredded == nil {
 			continue
 		}
-		st, ok := shredded.(*arrow.StructType)
-		if !ok {
-			continue
-		}
 		sc := &ShreddingSchema{Column: f.Name}
-		collectShredPaths(st, nil, sc)
+		collectShredPaths(shredded, nil, sc)
 		if len(sc.Paths) > 0 {
 			cfg.byColumn[f.Name] = sc
 		}
@@ -658,16 +809,19 @@ func ShreddingConfigFromSchema(s *iceberg.Schema) *ShreddingConfig {
 	return cfg
 }
 
-func collectShredPaths(st *arrow.StructType, prefix []string, out *ShreddingSchema) {
-	for i := range st.NumFields() {
-		field := st.Field(i)
-		segments := append(append([]string(nil), prefix...), field.Name)
-		switch t := field.Type.(type) {
-		case *arrow.StructType:
-			collectShredPaths(t, segments, out)
-		default:
-			out.Paths = append(out.Paths, ShreddingPath{Segments: segments, Type: field.Type})
+func collectShredPaths(dt arrow.DataType, prefix []string, out *ShreddingSchema) {
+	switch t := dt.(type) {
+	case *arrow.StructType:
+		for i := range t.NumFields() {
+			field := t.Field(i)
+			collectShredPaths(field.Type,
+				append(append([]string(nil), prefix...), field.Name), out)
 		}
+	case arrow.ListLikeType:
+		collectShredPaths(t.Elem(),
+			append(append([]string(nil), prefix...), arrayMarker), out)
+	default:
+		out.Paths = append(out.Paths, ShreddingPath{Segments: append([]string(nil), prefix...), Type: dt})
 	}
 }
 
@@ -797,7 +951,7 @@ func BuildShreddedVariantArray(in *extensions.VariantArray, schema *ShreddingSch
 
 	metaBuilder := builder.FieldBuilder(0).(*array.BinaryBuilder)
 	valueBuilder := builder.FieldBuilder(1).(*array.BinaryBuilder)
-	typedBuilder := builder.FieldBuilder(2).(*array.StructBuilder)
+	typedBuilder := builder.FieldBuilder(2)
 
 	tree := schema.Tree()
 
@@ -810,7 +964,7 @@ func BuildShreddedVariantArray(in *extensions.VariantArray, schema *ShreddingSch
 			builder.AppendNull()
 			metaBuilder.AppendNull()
 			valueBuilder.AppendNull()
-			appendNullObjectStruct(typedBuilder, tree)
+			appendNullForNode(typedBuilder, tree)
 
 			continue
 		}
@@ -826,12 +980,13 @@ func BuildShreddedVariantArray(in *extensions.VariantArray, schema *ShreddingSch
 
 		builder.Append(true)
 		metaBuilder.Append(shred.Metadata)
-		if shred.Root.ResidualValue != nil {
-			valueBuilder.Append(shred.Root.ResidualValue)
+		outerResidual := topLevelResidual(shred.Root)
+		if outerResidual != nil {
+			valueBuilder.Append(outerResidual)
 		} else {
 			valueBuilder.AppendNull()
 		}
-		if err := appendObjectStruct(typedBuilder, tree, shred.Root); err != nil {
+		if err := appendShreddedField(typedBuilder, tree, shred.Root); err != nil {
 			return nil, fmt.Errorf("variant shredding: row %d typed_value: %w", row, err)
 		}
 	}
@@ -842,85 +997,152 @@ func BuildShreddedVariantArray(in *extensions.VariantArray, schema *ShreddingSch
 	return array.NewExtensionArrayWithStorage(outType, storage), nil
 }
 
-// appendObjectStruct writes one row of an interior object node's
-// typed_value into the corresponding struct builder. Each child is a
-// {value, typed_value} pair per the spec.
-func appendObjectStruct(sb *array.StructBuilder, node *pathTree, obj ShreddedObject) error {
+// topLevelResidual extracts the residual bytes that belong on the
+// outer variant's `value` column. For object-rooted schemas this is
+// the sub-object residual; for leaf or array roots it's the
+// type-mismatch residual on the root field; nil otherwise.
+func topLevelResidual(root ShreddedField) []byte {
+	switch {
+	case root.Object != nil:
+		return root.Object.ResidualValue
+	case root.Residual != nil:
+		return root.Residual
+	}
+
+	return nil
+}
+
+// appendShreddedField writes one row's typed_value into b according
+// to node's kind. Caller has already appended validity to the outer
+// struct (or is appending into a leaf/array slot).
+func appendShreddedField(b array.Builder, node *pathTree, f ShreddedField) error {
+	switch {
+	case node.isLeaf():
+		if f.Present && f.Typed != nil {
+			return appendTypedValue(b, f.Typed)
+		}
+		b.AppendNull()
+
+		return nil
+	case node.isArray():
+		lb := b.(*array.ListBuilder)
+		if !f.Present || f.Array == nil {
+			lb.AppendNull()
+
+			return nil
+		}
+		lb.Append(true)
+		elemPair := lb.ValueBuilder().(*array.StructBuilder)
+		for _, elem := range f.Array.Elements {
+			if err := appendValueTypedPair(elemPair, node.arrayElem(), elem); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+	// Struct node.
+	sb := b.(*array.StructBuilder)
+	if !f.Present || f.Object == nil {
+		sb.AppendNull()
+		for i, name := range node.childOrder {
+			pair := sb.FieldBuilder(i).(*array.StructBuilder)
+			child := node.children[name]
+			pair.AppendNull()
+			pair.FieldBuilder(0).(*array.BinaryBuilder).AppendNull()
+			appendNullForNode(pair.FieldBuilder(1), child)
+		}
+
+		return nil
+	}
 	sb.Append(true)
 	for i, name := range node.childOrder {
 		child := node.children[name]
-		pairBuilder := sb.FieldBuilder(i).(*array.StructBuilder)
-		valueB := pairBuilder.FieldBuilder(0).(*array.BinaryBuilder)
-		typedB := pairBuilder.FieldBuilder(1)
-		f := obj.Fields[i]
-
-		if !f.Present {
-			pairBuilder.AppendNull()
-			valueB.AppendNull()
-			appendTypedNull(typedB, child)
-
-			continue
-		}
-		pairBuilder.Append(true)
-
-		switch {
-		case child.leafType != nil && f.Typed != nil:
-			valueB.AppendNull()
-			if err := appendTypedValue(typedB, f.Typed); err != nil {
-				return fmt.Errorf("path %q: %w", name, err)
-			}
-		case child.leafType != nil:
-			// Leaf, type mismatch -> raw bytes in `value`.
-			valueB.Append(f.Residual)
-			appendTypedNull(typedB, child)
-		case f.Object != nil:
-			// Interior, input was an object -> recurse into sub-tree.
-			if f.Object.ResidualValue != nil {
-				valueB.Append(f.Object.ResidualValue)
-			} else {
-				valueB.AppendNull()
-			}
-			if err := appendObjectStruct(typedB.(*array.StructBuilder), child, *f.Object); err != nil {
-				return fmt.Errorf("path %q: %w", name, err)
-			}
-		default:
-			// Interior, input was not an object -> raw bytes in
-			// `value`, typed_value null for the entire sub-tree.
-			valueB.Append(f.Residual)
-			appendTypedNull(typedB, child)
+		pair := sb.FieldBuilder(i).(*array.StructBuilder)
+		if err := appendValueTypedPair(pair, child, f.Object.Fields[i]); err != nil {
+			return fmt.Errorf("path %q: %w", name, err)
 		}
 	}
 
 	return nil
 }
 
-// appendNullObjectStruct appends a null for the typed_value struct at
-// any interior node, recursively nulling every leaf and intermediate
-// struct so the column lengths stay aligned.
-func appendNullObjectStruct(sb *array.StructBuilder, node *pathTree) {
-	sb.AppendNull()
-	for i, name := range node.childOrder {
-		child := node.children[name]
-		pairBuilder := sb.FieldBuilder(i).(*array.StructBuilder)
-		valueB := pairBuilder.FieldBuilder(0).(*array.BinaryBuilder)
-		typedB := pairBuilder.FieldBuilder(1)
-		pairBuilder.AppendNull()
-		valueB.AppendNull()
-		appendTypedNull(typedB, child)
-	}
-}
+// appendValueTypedPair writes one {value, typed_value} pair — the
+// per-field wrapping arrow-go's createShreddedField generates for
+// every shredded sub-position. The pair is itself a non-nullable
+// struct, so we always Append(true); per-field absence is encoded by
+// nulling both the inner value and typed_value.
+func appendValueTypedPair(pair *array.StructBuilder, node *pathTree, f ShreddedField) error {
+	pair.Append(true)
+	valueB := pair.FieldBuilder(0).(*array.BinaryBuilder)
+	typedB := pair.FieldBuilder(1)
 
-// appendTypedNull appends a null to typedB, the builder for one
-// child's `typed_value` field. For interior nodes that's a recursive
-// null-fill; for leaves it's a simple AppendNull on the primitive
-// builder.
-func appendTypedNull(typedB array.Builder, node *pathTree) {
-	if node.leafType != nil {
+	if !f.Present {
+		valueB.AppendNull()
+		appendNullForNode(typedB, node)
+
+		return nil
+	}
+	switch {
+	case node.isLeaf():
+		if f.Typed != nil {
+			valueB.AppendNull()
+
+			return appendTypedValue(typedB, f.Typed)
+		}
+		valueB.Append(f.Residual)
 		typedB.AppendNull()
 
-		return
+		return nil
+	case node.isArray():
+		if f.Array == nil {
+			// Array node, non-array payload.
+			valueB.Append(f.Residual)
+			appendNullForNode(typedB, node)
+
+			return nil
+		}
+		valueB.AppendNull()
+
+		return appendShreddedField(typedB, node, f)
 	}
-	appendNullObjectStruct(typedB.(*array.StructBuilder), node)
+	// Struct child.
+	if f.Object == nil {
+		valueB.Append(f.Residual)
+		appendNullForNode(typedB, node)
+
+		return nil
+	}
+	if f.Object.ResidualValue != nil {
+		valueB.Append(f.Object.ResidualValue)
+	} else {
+		valueB.AppendNull()
+	}
+
+	return appendShreddedField(typedB, node, f)
+}
+
+// appendNullForNode appends a null at every leaf builder underneath
+// node so column lengths stay aligned with the parent. For struct
+// and array nodes this recurses through the entire sub-tree.
+func appendNullForNode(b array.Builder, node *pathTree) {
+	switch {
+	case node.isLeaf():
+		b.AppendNull()
+	case node.isArray():
+		// A null list leaves child builders untouched.
+		b.(*array.ListBuilder).AppendNull()
+	default:
+		sb := b.(*array.StructBuilder)
+		sb.AppendNull()
+		for i, name := range node.childOrder {
+			child := node.children[name]
+			pair := sb.FieldBuilder(i).(*array.StructBuilder)
+			pair.AppendNull()
+			pair.FieldBuilder(0).(*array.BinaryBuilder).AppendNull()
+			appendNullForNode(pair.FieldBuilder(1), child)
+		}
+	}
 }
 
 func appendTypedValue(b array.Builder, v any) error {

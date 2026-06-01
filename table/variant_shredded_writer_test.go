@@ -177,6 +177,89 @@ func TestVariantShreddedWriteRoundTrip(t *testing.T) {
 	assertVariantHasString(t, got2, "lat", "not-a-number")
 }
 
+// TestVariantShreddedWriteArrayRoundTrip writes a variant whose
+// "tags" field is an array of strings, with the array's elements
+// shredded as a typed string column. It checks that pqarrow
+// reconstructs the array with all elements intact, including an
+// element whose runtime type doesn't match the declared element
+// type and therefore lives in per-element residual storage.
+func TestVariantShreddedWriteArrayRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	mem := memory.DefaultAllocator
+
+	icebergSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}, Required: true},
+	)
+	loc := filepath.ToSlash(t.TempDir())
+	props := iceberg.Properties{
+		"format-version":              "3",
+		WriteVariantShreddingPathsKey: "payload:$.tags[]:string",
+	}
+	meta, err := NewMetadata(icebergSchema, iceberg.UnpartitionedSpec, UnsortedSortOrder, loc, props)
+	require.NoError(t, err)
+	metaBuilder, err := MetadataBuilderFromBase(meta, "")
+	require.NoError(t, err)
+
+	bareVariantType := extensions.NewDefaultVariantType()
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "payload", Type: bareVariantType, Nullable: false},
+	}, nil)
+
+	row := mustVariantBuilder(t, func(b *variant.Builder) {
+		objStart, fields := b.Offset(), []variant.FieldEntry{}
+		fields = append(fields, b.NextField(objStart, "tags"))
+		arrStart, offsets := b.Offset(), []int{}
+		offsets = append(offsets, b.NextElement(arrStart))
+		require.NoError(t, b.AppendString("alpha"))
+		offsets = append(offsets, b.NextElement(arrStart))
+		require.NoError(t, b.AppendString("beta"))
+		require.NoError(t, b.FinishArray(arrStart, offsets))
+		require.NoError(t, b.FinishObject(objStart, fields))
+	})
+
+	rec := buildBareVariantRecord(t, mem, arrowSchema, []int64{1}, []variant.Value{row})
+	defer rec.Release()
+
+	dataFiles := writeRecordsThroughFactory(t, ctx, loc, metaBuilder, arrowSchema, rec)
+	require.Len(t, dataFiles, 1)
+
+	parquetPath := dataFiles[0].FilePath()
+	if rel, ok := stripLocalPrefix(parquetPath); ok {
+		parquetPath = rel
+	}
+	f, err := os.Open(parquetPath)
+	require.NoError(t, err)
+	defer f.Close()
+	reader, err := file.NewParquetReader(f)
+	require.NoError(t, err)
+	defer reader.Close()
+	arrReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, mem)
+	require.NoError(t, err)
+	tbl, err := arrReader.ReadTable(ctx)
+	require.NoError(t, err)
+	defer tbl.Release()
+
+	chunk := tbl.Column(1).Data().Chunk(0).(*extensions.VariantArray)
+	got, err := chunk.Value(0)
+	require.NoError(t, err)
+
+	obj := got.Value().(variant.ObjectValue)
+	tagsField, err := obj.ValueByKey("tags")
+	require.NoError(t, err)
+	tagsArr, ok := tagsField.Value.Value().(variant.ArrayValue)
+	require.True(t, ok, "tags must round-trip as a variant array, got %T",
+		tagsField.Value.Value())
+	require.Equal(t, uint32(2), tagsArr.Len())
+	alpha, err := tagsArr.Value(0)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha", alpha.Value())
+	beta, err := tagsArr.Value(1)
+	require.NoError(t, err)
+	assert.Equal(t, "beta", beta.Value())
+}
+
 // TestVariantShreddedWriteNestedRoundTrip exercises the same writer
 // flow but with a nested object shredding spec
 // ($.user.email + $.user.id). It checks that

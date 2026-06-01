@@ -116,6 +116,148 @@ func TestParseShreddingPaths(t *testing.T) {
 		require.NotNil(t, cfg.ForColumn("c"))
 		assert.Len(t, cfg.ForColumn("c").Paths, 2)
 	})
+
+	t.Run("accepts top-level primitive shredding", func(t *testing.T) {
+		cfg, err := internal.ParseShreddingPaths("c:$:double")
+		require.NoError(t, err)
+		p := cfg.ForColumn("c")
+		require.NotNil(t, p)
+		require.Len(t, p.Paths, 1)
+		assert.Empty(t, p.Paths[0].Segments)
+		assert.Equal(t, arrow.PrimitiveTypes.Float64, p.Paths[0].Type)
+	})
+
+	t.Run("rejects top-level alongside another path", func(t *testing.T) {
+		_, err := internal.ParseShreddingPaths("c:$:double, c:$.foo:int")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "conflicts")
+	})
+
+	t.Run("accepts array element shredding", func(t *testing.T) {
+		cfg, err := internal.ParseShreddingPaths("c:$.tags[]:string")
+		require.NoError(t, err)
+		p := cfg.ForColumn("c")
+		require.NotNil(t, p)
+		require.Len(t, p.Paths, 1)
+		assert.Equal(t, []string{"tags", "[]"}, p.Paths[0].Segments)
+	})
+
+	t.Run("accepts nested array elements", func(t *testing.T) {
+		cfg, err := internal.ParseShreddingPaths("c:$.events[].timestamp:long")
+		require.NoError(t, err)
+		p := cfg.ForColumn("c")
+		require.NotNil(t, p)
+		require.Len(t, p.Paths, 1)
+		assert.Equal(t, []string{"events", "[]", "timestamp"}, p.Paths[0].Segments)
+	})
+
+	t.Run("rejects positional array indexing", func(t *testing.T) {
+		_, err := internal.ParseShreddingPaths("c:$.foo[0]:int")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "positional array indexing not supported")
+	})
+}
+
+func TestShredVariantTopLevelPrimitive(t *testing.T) {
+	// Schema declares the whole variant column as a shredded double.
+	schema := &internal.ShreddingSchema{
+		Column: "value",
+		Paths:  []internal.ShreddingPath{{Segments: nil, Type: arrow.PrimitiveTypes.Float64}},
+	}
+
+	t.Run("matching primitive lands in typed", func(t *testing.T) {
+		v, err := variant.Of[float64](3.14159)
+		require.NoError(t, err)
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		assert.True(t, res.Root.Present)
+		assert.InDelta(t, 3.14159, res.Root.Typed.(float64), 1e-9)
+		assert.Nil(t, res.Root.Residual)
+		assert.Nil(t, res.Root.Object)
+	})
+
+	t.Run("type mismatch routes to residual", func(t *testing.T) {
+		v := mustVariant(t, `"hello"`)
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		assert.True(t, res.Root.Present)
+		assert.Nil(t, res.Root.Typed)
+		assert.Equal(t, v.Bytes(), res.Root.Residual)
+	})
+}
+
+func TestShredVariantArray(t *testing.T) {
+	t.Run("array of primitives", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Column: "tags",
+			Paths:  []internal.ShreddingPath{{Segments: []string{"[]"}, Type: arrow.BinaryTypes.String}},
+		}
+		v := mustVariant(t, `["alpha", "beta", "gamma"]`)
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		require.NotNil(t, res.Root.Array)
+		require.Len(t, res.Root.Array.Elements, 3)
+		assert.Equal(t, "alpha", res.Root.Array.Elements[0].Typed)
+		assert.Equal(t, "beta", res.Root.Array.Elements[1].Typed)
+		assert.Equal(t, "gamma", res.Root.Array.Elements[2].Typed)
+	})
+
+	t.Run("array element type mismatch routes to per-element residual", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{{Segments: []string{"[]"}, Type: arrow.PrimitiveTypes.Int64}},
+		}
+		v := mustVariant(t, `[1, "two", 3]`)
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		require.NotNil(t, res.Root.Array)
+		require.Len(t, res.Root.Array.Elements, 3)
+		assert.EqualValues(t, 1, res.Root.Array.Elements[0].Typed)
+		assert.Nil(t, res.Root.Array.Elements[1].Typed)
+		assert.NotNil(t, res.Root.Array.Elements[1].Residual,
+			"non-int element should land in per-path residual bytes")
+		assert.EqualValues(t, 3, res.Root.Array.Elements[2].Typed)
+	})
+
+	t.Run("nested array elements (events[].timestamp)", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{
+				{Segments: []string{"events", "[]", "timestamp"}, Type: arrow.PrimitiveTypes.Int64},
+			},
+		}
+		v := mustVariant(t, `{"events": [{"timestamp": 1, "kind": "click"}, {"timestamp": 2}]}`)
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		require.NotNil(t, res.Root.Object)
+		eventsField := res.Root.Object.Fields[0]
+		require.NotNil(t, eventsField.Array)
+		require.Len(t, eventsField.Array.Elements, 2)
+
+		// Element 0: timestamp shredded, kind goes into the
+		// element's residual sub-object.
+		first := eventsField.Array.Elements[0]
+		require.NotNil(t, first.Object)
+		assert.EqualValues(t, 1, first.Object.Fields[0].Typed)
+		require.NotNil(t, first.Object.ResidualValue,
+			"unshredded 'kind' must land in the element's residual")
+
+		// Element 1: only timestamp, no residual.
+		second := eventsField.Array.Elements[1]
+		require.NotNil(t, second.Object)
+		assert.EqualValues(t, 2, second.Object.Fields[0].Typed)
+		assert.Nil(t, second.Object.ResidualValue)
+	})
+
+	t.Run("non-array payload routes to residual", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{{Segments: []string{"[]"}, Type: arrow.BinaryTypes.String}},
+		}
+		v := mustVariant(t, `"not-an-array"`)
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		assert.Nil(t, res.Root.Array)
+		assert.Equal(t, v.Bytes(), res.Root.Residual)
+		assert.True(t, res.Root.Present)
+	})
 }
 
 func mustVariant(t *testing.T, jsonText string) variant.Value {
@@ -140,13 +282,13 @@ func TestShredVariantTopLevel(t *testing.T) {
 		v := mustVariant(t, `{"lat": 1.5, "lng": 2.5, "tier": 3}`)
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
-		assert.Nil(t, res.Root.ResidualValue,
+		assert.Nil(t, res.Root.Object.ResidualValue,
 			"residual must be null when every field is shredded")
-		require.Len(t, res.Root.Fields, 3)
-		assert.Equal(t, float64(1.5), res.Root.Fields[0].Typed)
-		assert.Equal(t, float64(2.5), res.Root.Fields[1].Typed)
-		assert.Equal(t, int32(3), res.Root.Fields[2].Typed)
-		for i, f := range res.Root.Fields {
+		require.Len(t, res.Root.Object.Fields, 3)
+		assert.Equal(t, float64(1.5), res.Root.Object.Fields[0].Typed)
+		assert.Equal(t, float64(2.5), res.Root.Object.Fields[1].Typed)
+		assert.Equal(t, int32(3), res.Root.Object.Fields[2].Typed)
+		for i, f := range res.Root.Object.Fields {
 			assert.True(t, f.Present, "field %d should be present", i)
 			assert.Nil(t, f.Residual, "field %d should not have residual storage", i)
 		}
@@ -156,11 +298,11 @@ func TestShredVariantTopLevel(t *testing.T) {
 		v := mustVariant(t, `{"lat": 1.5, "extra": "hello", "tier": 7}`)
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
-		require.NotNil(t, res.Root.ResidualValue,
+		require.NotNil(t, res.Root.Object.ResidualValue,
 			"residual must carry the unshredded fields")
 
 		// Reconstruct and confirm only "extra" survived.
-		residual, err := variant.New(res.Metadata, res.Root.ResidualValue)
+		residual, err := variant.New(res.Metadata, res.Root.Object.ResidualValue)
 		require.NoError(t, err)
 		obj, ok := residual.Value().(variant.ObjectValue)
 		require.True(t, ok, "residual should be an object")
@@ -169,9 +311,9 @@ func TestShredVariantTopLevel(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "hello", field.Value.Value())
 
-		assert.Equal(t, float64(1.5), res.Root.Fields[0].Typed)
-		assert.False(t, res.Root.Fields[1].Present, "lng missing in input -> Present=false")
-		assert.Equal(t, int32(7), res.Root.Fields[2].Typed)
+		assert.Equal(t, float64(1.5), res.Root.Object.Fields[0].Typed)
+		assert.False(t, res.Root.Object.Fields[1].Present, "lng missing in input -> Present=false")
+		assert.Equal(t, int32(7), res.Root.Object.Fields[2].Typed)
 	})
 
 	t.Run("type mismatch routes to per-path residual", func(t *testing.T) {
@@ -180,14 +322,14 @@ func TestShredVariantTopLevel(t *testing.T) {
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
 
-		f := res.Root.Fields[0]
+		f := res.Root.Object.Fields[0]
 		assert.True(t, f.Present, "path present in input even though type mismatched")
 		assert.Nil(t, f.Typed)
 		require.NotNil(t, f.Residual, "type mismatch must store raw variant bytes in residual")
 
-		assert.False(t, res.Root.Fields[1].Present)
-		assert.False(t, res.Root.Fields[2].Present)
-		assert.Nil(t, res.Root.ResidualValue,
+		assert.False(t, res.Root.Object.Fields[1].Present)
+		assert.False(t, res.Root.Object.Fields[2].Present)
+		assert.Nil(t, res.Root.Object.ResidualValue,
 			"lat was diverted to its per-path residual; no outer residual")
 	})
 
@@ -195,11 +337,13 @@ func TestShredVariantTopLevel(t *testing.T) {
 		v := mustVariant(t, `"top-level string"`)
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
-		assert.Equal(t, v.Bytes(), res.Root.ResidualValue,
-			"non-object inputs round-trip as residual unchanged")
-		for i, f := range res.Root.Fields {
-			assert.False(t, f.Present, "no shredding applies to non-object: field %d", i)
-		}
+		// Root.Object is nil because the variant was not an object;
+		// raw bytes flow into Root.Residual instead so the writer
+		// stamps the outer `value` column and nulls typed_value.
+		assert.Nil(t, res.Root.Object)
+		assert.Equal(t, v.Bytes(), res.Root.Residual,
+			"non-object inputs round-trip as Root.Residual unchanged")
+		assert.True(t, res.Root.Present)
 	})
 
 	t.Run("nil schema errors", func(t *testing.T) {
@@ -248,8 +392,8 @@ func TestShredVariantNested(t *testing.T) {
 
 		// Outer level: misc stays in outer residual; lat + user
 		// fully consumed by typed_value paths.
-		require.NotNil(t, res.Root.ResidualValue)
-		outerResidual, err := variant.New(res.Metadata, res.Root.ResidualValue)
+		require.NotNil(t, res.Root.Object.ResidualValue)
+		outerResidual, err := variant.New(res.Metadata, res.Root.Object.ResidualValue)
 		require.NoError(t, err)
 		outerObj := outerResidual.Value().(variant.ObjectValue)
 		require.Equal(t, uint32(1), outerObj.NumElements())
@@ -258,10 +402,10 @@ func TestShredVariantNested(t *testing.T) {
 		assert.Equal(t, "kept-in-outer-residual", miscField.Value.Value())
 
 		// Root.Fields[0] is lat -> primitive shred match.
-		assert.Equal(t, float64(10.5), res.Root.Fields[0].Typed)
+		assert.Equal(t, float64(10.5), res.Root.Object.Fields[0].Typed)
 
 		// Root.Fields[1] is user -> interior object node.
-		userField := res.Root.Fields[1]
+		userField := res.Root.Object.Fields[1]
 		require.True(t, userField.Present)
 		require.NotNil(t, userField.Object,
 			"user is an interior object node so Object must be set")
@@ -287,7 +431,7 @@ func TestShredVariantNested(t *testing.T) {
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
 
-		userField := res.Root.Fields[1]
+		userField := res.Root.Object.Fields[1]
 		require.True(t, userField.Present)
 		assert.Nil(t, userField.Object,
 			"non-object payload at user path leaves Object unset")
@@ -299,8 +443,8 @@ func TestShredVariantNested(t *testing.T) {
 		v := mustVariant(t, `{"lat": 1.0}`)
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
-		assert.True(t, res.Root.Fields[0].Present, "lat present")
-		assert.False(t, res.Root.Fields[1].Present, "user absent in source")
+		assert.True(t, res.Root.Object.Fields[0].Present, "lat present")
+		assert.False(t, res.Root.Object.Fields[1].Present, "user absent in source")
 	})
 }
 
