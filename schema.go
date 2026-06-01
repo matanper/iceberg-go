@@ -568,7 +568,7 @@ type SchemaVisitorPerPrimitiveType[T any] interface {
 	VisitBinary() T
 	VisitUUID() T
 	VisitUnknown() T
-	VisitVariant() T
+	VisitVariant(VariantType) T
 	VisitGeometry(GeometryType) T
 	VisitGeography(GeographyType) T
 }
@@ -682,7 +682,7 @@ func visitField[T any](f NestedField, visitor SchemaVisitor[T]) T {
 		return visitMap(*typ, visitor)
 	case VariantType:
 		if perPrimitive, ok := visitor.(SchemaVisitorPerPrimitiveType[T]); ok {
-			return perPrimitive.VisitVariant()
+			return perPrimitive.VisitVariant(typ)
 		}
 
 		return visitor.Variant(typ)

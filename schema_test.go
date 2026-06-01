@@ -1306,7 +1306,7 @@ func (noopSchemaVisitor) VisitGeometry(_ iceberg.GeometryType) iceberg.Void { re
 
 func (noopSchemaVisitor) VisitGeography(_ iceberg.GeographyType) iceberg.Void { return iceberg.Void{} }
 
-func (noopSchemaVisitor) VisitVariant() iceberg.Void { return iceberg.Void{} }
+func (noopSchemaVisitor) VisitVariant(iceberg.VariantType) iceberg.Void { return iceberg.Void{} }
 
 var _ iceberg.SchemaVisitorPerPrimitiveType[iceberg.Void] = noopSchemaVisitor{}
 

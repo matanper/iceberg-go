@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/geoarrow/geoarrow-go"
 )
@@ -826,7 +827,28 @@ func (UnknownType) String() string { return "unknown" }
 
 // VariantType represents semi-structured data stored using the Parquet Variant
 // binary encoding. Requires Iceberg format version 3+.
-type VariantType struct{}
+//
+// A VariantType may optionally carry a shredding spec: an Arrow data type that
+// describes the shape of the Parquet Variant "typed_value" field used during
+// shredded writes. Shredding is a *physical* concern — it changes the on-disk
+// Parquet layout but not the logical Iceberg type — so Equals, Type, String,
+// and JSON marshalling deliberately ignore it. Two VariantTypes that differ
+// only in their shredding spec are considered equal.
+type VariantType struct {
+	shredded arrow.DataType
+}
+
+// NewShreddedVariantType returns a VariantType whose physical Parquet
+// representation includes a typed_value field with the given Arrow data type.
+// Pass nil to get an unshredded VariantType (identical to the zero value).
+func NewShreddedVariantType(typedValue arrow.DataType) VariantType {
+	return VariantType{shredded: typedValue}
+}
+
+// Shredded returns the Arrow data type used for the variant's typed_value
+// field, or nil if the variant is not shredded. The returned type, when
+// non-nil, mirrors the contract of arrow extensions.NewShreddedVariantType.
+func (v VariantType) Shredded() arrow.DataType { return v.shredded }
 
 func (VariantType) Equals(other Type) bool {
 	_, ok := other.(VariantType)

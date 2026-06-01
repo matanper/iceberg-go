@@ -426,6 +426,46 @@ func TestVariantArrowConversion(t *testing.T) {
 		assert.True(t, ice.Field(1).Type.Equals(iceberg.VariantType{}))
 		assert.True(t, ice.Field(2).Type.Equals(iceberg.VariantType{}))
 	})
+
+	t.Run("shredded variant emits typed_value", func(t *testing.T) {
+		typedSpec := arrow.StructOf(
+			arrow.Field{Name: "latitude", Type: arrow.PrimitiveTypes.Float64},
+			arrow.Field{Name: "longitude", Type: arrow.PrimitiveTypes.Float32},
+		)
+		shreddedSc := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "ts", Type: iceberg.PrimitiveTypes.Timestamp, Required: true},
+			iceberg.NestedField{ID: 2, Name: "loc", Type: iceberg.NewShreddedVariantType(typedSpec)},
+		)
+
+		arrowSc, err := table.SchemaToArrowSchema(shreddedSc, nil, true, false)
+		require.NoError(t, err)
+
+		locField := arrowSc.Field(1)
+		ext, ok := locField.Type.(arrow.ExtensionType)
+		require.True(t, ok, "expected extension type, got %T", locField.Type)
+		assert.Equal(t, "parquet.variant", ext.ExtensionName())
+
+		st, ok := ext.StorageType().(*arrow.StructType)
+		require.True(t, ok, "expected struct storage type, got %T", ext.StorageType())
+		require.Equal(t, 3, st.NumFields(),
+			"shredded variant storage must have metadata + value + typed_value")
+		assert.Equal(t, "metadata", st.Field(0).Name)
+		assert.Equal(t, "value", st.Field(1).Name)
+		assert.Equal(t, "typed_value", st.Field(2).Name)
+
+		// Equality and JSON identity must NOT depend on shredding — it's
+		// a physical-only concern that the table metadata never persists.
+		assert.True(t, iceberg.NewShreddedVariantType(typedSpec).Equals(iceberg.VariantType{}))
+		assert.Equal(t, "variant", iceberg.NewShreddedVariantType(typedSpec).String())
+
+		// Round-tripping a shredded Arrow variant back through
+		// ArrowSchemaToIceberg deliberately collapses to bare VariantType{}:
+		// the spec carries no shredding info and the JSON metadata can't
+		// either, so the asymmetry is intentional.
+		ice, err := table.ArrowSchemaToIceberg(arrowSc, false, nil)
+		require.NoError(t, err)
+		assert.True(t, ice.Field(1).Type.Equals(iceberg.VariantType{}))
+	})
 }
 
 func TestVariantProjectionExclusion(t *testing.T) {

@@ -181,7 +181,7 @@ func (convertToSubstrait) VisitGeography(iceberg.GeographyType) types.Type {
 	return &types.BinaryType{}
 }
 
-func (convertToSubstrait) VisitVariant() types.Type {
+func (convertToSubstrait) VisitVariant(iceberg.VariantType) types.Type {
 	// Variant has no Substrait equivalent today. We return BinaryType as a
 	// structural placeholder so that schema conversion and expression binding
 	// on sibling columns don't panic with a nil type. A proper user-defined

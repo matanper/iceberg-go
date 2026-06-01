@@ -645,7 +645,15 @@ func (c convertToArrow) VisitUnknown() arrow.Field {
 	return arrow.Field{Type: arrow.Null}
 }
 
-func (c convertToArrow) VisitVariant() arrow.Field {
+func (c convertToArrow) VisitVariant(v iceberg.VariantType) arrow.Field {
+	if shredded := v.Shredded(); shredded != nil {
+		// Shredded variants always use standard binary storage for the
+		// metadata/value fields; useLargeTypes is intentionally ignored here
+		// because Parquet shredded-variant readers (Spark, Athena, S3 Tables)
+		// expect the canonical layout produced by extensions.NewShreddedVariantType.
+		return arrow.Field{Type: extensions.NewShreddedVariantType(shredded)}
+	}
+
 	if c.useLargeTypes {
 		vt, _ := extensions.NewVariantType(arrow.StructOf(
 			arrow.Field{Name: "metadata", Type: arrow.BinaryTypes.LargeBinary, Nullable: false},
