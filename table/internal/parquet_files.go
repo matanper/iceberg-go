@@ -334,6 +334,14 @@ type ParquetFileWriter struct {
 	info       WriteFileInfo
 	partition  map[int]any
 	colMapping map[string]int
+
+	// mem is captured at file-open time and used to allocate the
+	// shredded variant arrays produced by ShredRecordBatch in Write.
+	mem memory.Allocator
+	// shreddingCfg is derived from info.FileSchema at file-open and
+	// drives the per-batch variant transform in Write. Empty when no
+	// variant column on this file has a shredding spec.
+	shreddingCfg *ShreddingConfig
 }
 
 // NewFileWriter creates a ParquetFileWriter that writes batches to a single
@@ -367,19 +375,38 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 	}
 
 	return &ParquetFileWriter{
-		pqWriter:   writer,
-		counter:    counter,
-		fileCloser: fw,
-		format:     p,
-		info:       info,
-		partition:  partitionValues,
-		colMapping: colMapping,
+		pqWriter:     writer,
+		counter:      counter,
+		fileCloser:   fw,
+		format:       p,
+		info:         info,
+		partition:    partitionValues,
+		colMapping:   colMapping,
+		mem:          mem,
+		shreddingCfg: ShreddingConfigFromSchema(info.FileSchema),
 	}, nil
 }
 
 // Write appends a record batch to the Parquet file.
+//
+// When the file's FileSchema carries a shredded VariantType on any
+// column and the incoming batch's matching column is still in the
+// bare metadata+value layout, the batch is transformed via
+// ShredRecordBatch before reaching pqarrow. This keeps shredding
+// scoped to the Parquet format model — Avro / Orc writers won't
+// reshape variants — and matches the wiring location requested by
+// apache/iceberg-go#987.
 func (w *ParquetFileWriter) Write(batch arrow.RecordBatch) error {
-	return w.pqWriter.WriteBuffered(batch)
+	if w.shreddingCfg.Empty() {
+		return w.pqWriter.WriteBuffered(batch)
+	}
+	shredded, err := ShredRecordBatch(batch, w.shreddingCfg, w.mem)
+	if err != nil {
+		return err
+	}
+	defer shredded.Release()
+
+	return w.pqWriter.WriteBuffered(shredded)
 }
 
 // BytesWritten returns the number of bytes flushed to the output so far.

@@ -177,6 +177,111 @@ func TestVariantShreddedWriteRoundTrip(t *testing.T) {
 	assertVariantHasString(t, got2, "lat", "not-a-number")
 }
 
+// TestVariantShreddedWriteNestedRoundTrip exercises the same writer
+// flow but with a nested object shredding spec
+// ($.user.email + $.user.id). It checks that
+//   - the on-disk typed_value carries a struct under "user"
+//   - the per-row residual at the user level captures unshredded
+//     sub-fields ("name" in the test)
+//   - top-level reconstruction yields the original variant
+func TestVariantShreddedWriteNestedRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	mem := memory.DefaultAllocator
+
+	icebergSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}, Required: true},
+	)
+	loc := filepath.ToSlash(t.TempDir())
+	props := iceberg.Properties{
+		"format-version":              "3",
+		WriteVariantShreddingPathsKey: "payload:$.user.email:string, payload:$.user.id:long",
+	}
+	meta, err := NewMetadata(icebergSchema, iceberg.UnpartitionedSpec, UnsortedSortOrder, loc, props)
+	require.NoError(t, err)
+	metaBuilder, err := MetadataBuilderFromBase(meta, "")
+	require.NoError(t, err)
+
+	bareVariantType := extensions.NewDefaultVariantType()
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "payload", Type: bareVariantType, Nullable: false},
+	}, nil)
+
+	row := mustVariantBuilder(t, func(b *variant.Builder) {
+		start, fields := b.Offset(), []variant.FieldEntry{}
+		fields = append(fields, b.NextField(start, "user"))
+		userStart, userFields := b.Offset(), []variant.FieldEntry{}
+		userFields = append(userFields, b.NextField(userStart, "email"))
+		require.NoError(t, b.AppendString("a@b.com"))
+		userFields = append(userFields, b.NextField(userStart, "id"))
+		require.NoError(t, b.AppendInt(42))
+		userFields = append(userFields, b.NextField(userStart, "name"))
+		require.NoError(t, b.AppendString("Alice"))
+		require.NoError(t, b.FinishObject(userStart, userFields))
+		require.NoError(t, b.FinishObject(start, fields))
+	})
+
+	rec := buildBareVariantRecord(t, mem, arrowSchema, []int64{1}, []variant.Value{row})
+	defer rec.Release()
+
+	dataFiles := writeRecordsThroughFactory(t, ctx, loc, metaBuilder, arrowSchema, rec)
+	require.Len(t, dataFiles, 1)
+
+	parquetPath := dataFiles[0].FilePath()
+	if rel, ok := stripLocalPrefix(parquetPath); ok {
+		parquetPath = rel
+	}
+	f, err := os.Open(parquetPath)
+	require.NoError(t, err)
+	defer f.Close()
+	reader, err := file.NewParquetReader(f)
+	require.NoError(t, err)
+	defer reader.Close()
+	arrReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, mem)
+	require.NoError(t, err)
+	tbl, err := arrReader.ReadTable(ctx)
+	require.NoError(t, err)
+	defer tbl.Release()
+
+	chunk := tbl.Column(1).Data().Chunk(0).(*extensions.VariantArray)
+	got, err := chunk.Value(0)
+	require.NoError(t, err)
+
+	// Full reconstruction should expose user as an object with all
+	// three sub-fields, including the unshredded "name".
+	obj, ok := got.Value().(variant.ObjectValue)
+	require.True(t, ok)
+	userField, err := obj.ValueByKey("user")
+	require.NoError(t, err)
+	userObj, ok := userField.Value.Value().(variant.ObjectValue)
+	require.True(t, ok)
+
+	email, err := userObj.ValueByKey("email")
+	require.NoError(t, err)
+	assert.Equal(t, "a@b.com", email.Value.Value())
+
+	id, err := userObj.ValueByKey("id")
+	require.NoError(t, err)
+	// AppendInt picks the smallest variant int; widen for comparison.
+	switch n := id.Value.Value().(type) {
+	case int8:
+		assert.EqualValues(t, 42, n)
+	case int16:
+		assert.EqualValues(t, 42, n)
+	case int32:
+		assert.EqualValues(t, 42, n)
+	case int64:
+		assert.EqualValues(t, 42, n)
+	default:
+		t.Fatalf("id has unexpected runtime type %T (%v)", n, n)
+	}
+
+	name, err := userObj.ValueByKey("name")
+	require.NoError(t, err)
+	assert.Equal(t, "Alice", name.Value.Value())
+}
+
 func mustVariantBuilder(t *testing.T, fn func(*variant.Builder)) variant.Value {
 	t.Helper()
 	var b variant.Builder
