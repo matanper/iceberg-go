@@ -26,6 +26,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/apache/iceberg-go/table/internal"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -258,6 +259,113 @@ func TestShredVariantArray(t *testing.T) {
 		assert.Equal(t, v.Bytes(), res.Root.Residual)
 		assert.True(t, res.Root.Present)
 	})
+
+	t.Run("empty array yields empty typed list", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{{Segments: []string{"[]"}, Type: arrow.BinaryTypes.String}},
+		}
+		var b variant.Builder
+		start, offsets := b.Offset(), []int{}
+		require.NoError(t, b.FinishArray(start, offsets))
+		v, err := b.Build()
+		require.NoError(t, err)
+
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		require.NotNil(t, res.Root.Array,
+			"empty array still gets an Array result (not residual)")
+		assert.Empty(t, res.Root.Array.Elements,
+			"typed_value list has zero elements")
+		assert.True(t, res.Root.Present)
+	})
+
+	t.Run("array of variant nulls -> per-element residual", func(t *testing.T) {
+		// Each element is a variant null primitive, not the array's
+		// absence. Declared element type is string, so each null
+		// fails extractTyped and lands in the element's Residual.
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{{Segments: []string{"[]"}, Type: arrow.BinaryTypes.String}},
+		}
+		var b variant.Builder
+		start, offsets := b.Offset(), []int{}
+		offsets = append(offsets, b.NextElement(start))
+		require.NoError(t, b.AppendNull())
+		offsets = append(offsets, b.NextElement(start))
+		require.NoError(t, b.AppendNull())
+		require.NoError(t, b.FinishArray(start, offsets))
+		v, err := b.Build()
+		require.NoError(t, err)
+
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		require.NotNil(t, res.Root.Array)
+		require.Len(t, res.Root.Array.Elements, 2)
+		for i, elem := range res.Root.Array.Elements {
+			assert.True(t, elem.Present, "element %d still present even when null", i)
+			assert.Nil(t, elem.Typed)
+			assert.NotNil(t, elem.Residual,
+				"variant null at element %d must round-trip via residual bytes", i)
+		}
+	})
+}
+
+func TestShredVariantLeafTypeExtensions(t *testing.T) {
+	t.Run("date payload extracts to arrow.Date32", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{{Segments: nil, Type: arrow.FixedWidthTypes.Date32}},
+		}
+		var b variant.Builder
+		want := arrow.Date32(19_876) // arbitrary
+		require.NoError(t, b.AppendDate(want))
+		v, err := b.Build()
+		require.NoError(t, err)
+
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		assert.True(t, res.Root.Present)
+		assert.Equal(t, want, res.Root.Typed)
+	})
+
+	t.Run("uuid payload extracts to uuid.UUID", func(t *testing.T) {
+		schema := &internal.ShreddingSchema{
+			Paths: []internal.ShreddingPath{{Segments: nil, Type: extensions.NewUUIDType()}},
+		}
+		want := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+		var b variant.Builder
+		require.NoError(t, b.AppendUUID(want))
+		v, err := b.Build()
+		require.NoError(t, err)
+
+		res, err := internal.ShredVariant(v, schema)
+		require.NoError(t, err)
+		assert.True(t, res.Root.Present)
+		assert.Equal(t, want, res.Root.Typed)
+	})
+}
+
+func TestShredVariantVariantNullAtShreddedPath(t *testing.T) {
+	schema := &internal.ShreddingSchema{
+		Paths: []internal.ShreddingPath{
+			{Segments: []string{"lat"}, Type: arrow.PrimitiveTypes.Float64},
+		},
+	}
+
+	v := objBuilder(t, func(b *variant.Builder, start int, fields *[]variant.FieldEntry) {
+		*fields = append(*fields, b.NextField(start, "lat"))
+		require.NoError(t, b.AppendNull())
+	})
+	res, err := internal.ShredVariant(v, schema)
+	require.NoError(t, err)
+
+	lat := res.Root.Object.Fields[0]
+	assert.True(t, lat.Present,
+		"variant null payload still counts as present in the source object")
+	assert.Nil(t, lat.Typed,
+		"variant null does not satisfy a numeric leaf type")
+	require.NotNil(t, lat.Residual,
+		"variant null lands in per-path residual so a reader can recover it")
+	assert.Nil(t, res.Root.Object.ResidualValue,
+		"lat was fully consumed by the per-path slot; no outer residual")
 }
 
 func mustVariant(t *testing.T, jsonText string) variant.Value {
@@ -266,6 +374,30 @@ func mustVariant(t *testing.T, jsonText string) variant.Value {
 	require.NoError(t, err)
 
 	return v
+}
+
+// objBuilder runs fn against a variant builder pre-set up to write an
+// object at the current offset, returning the finalized value. Used
+// when tests need precise control over the on-wire variant type of a
+// field — JSON parsing chooses the smallest matching primitive
+// (e.g. it turns 1.5 into a Decimal4, not a Float64), which would
+// fail to match shredding declarations of type "double".
+func objBuilder(t *testing.T, fn func(b *variant.Builder, start int, fields *[]variant.FieldEntry)) variant.Value {
+	t.Helper()
+	var b variant.Builder
+	start, fields := b.Offset(), []variant.FieldEntry{}
+	fn(&b, start, &fields)
+	require.NoError(t, b.FinishObject(start, fields))
+	v, err := b.Build()
+	require.NoError(t, err)
+
+	return v
+}
+
+func mustField[T any](t *testing.T, b *variant.Builder, start int, fields *[]variant.FieldEntry, key string, appendFn func(*variant.Builder, T) error, value T) {
+	t.Helper()
+	*fields = append(*fields, b.NextField(start, key))
+	require.NoError(t, appendFn(b, value))
 }
 
 func TestShredVariantTopLevel(t *testing.T) {
@@ -279,7 +411,11 @@ func TestShredVariantTopLevel(t *testing.T) {
 	}
 
 	t.Run("all paths matched leaves no residual", func(t *testing.T) {
-		v := mustVariant(t, `{"lat": 1.5, "lng": 2.5, "tier": 3}`)
+		v := objBuilder(t, func(b *variant.Builder, start int, fields *[]variant.FieldEntry) {
+			mustField(t, b, start, fields, "lat", (*variant.Builder).AppendFloat64, 1.5)
+			mustField(t, b, start, fields, "lng", (*variant.Builder).AppendFloat64, 2.5)
+			mustField(t, b, start, fields, "tier", (*variant.Builder).AppendInt, int64(3))
+		})
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
 		assert.Nil(t, res.Root.Object.ResidualValue,
@@ -295,7 +431,11 @@ func TestShredVariantTopLevel(t *testing.T) {
 	})
 
 	t.Run("unshredded fields land in residual", func(t *testing.T) {
-		v := mustVariant(t, `{"lat": 1.5, "extra": "hello", "tier": 7}`)
+		v := objBuilder(t, func(b *variant.Builder, start int, fields *[]variant.FieldEntry) {
+			mustField(t, b, start, fields, "lat", (*variant.Builder).AppendFloat64, 1.5)
+			mustField(t, b, start, fields, "extra", (*variant.Builder).AppendString, "hello")
+			mustField(t, b, start, fields, "tier", (*variant.Builder).AppendInt, int64(7))
+		})
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
 		require.NotNil(t, res.Root.Object.ResidualValue,
@@ -382,11 +522,16 @@ func TestShredVariantNested(t *testing.T) {
 	})
 
 	t.Run("nested shred plus outer residual", func(t *testing.T) {
-		v := mustVariant(t, `{
-			"lat": 10.5,
-			"user": {"email": "a@b.com", "id": 42, "name": "Alice"},
-			"misc": "kept-in-outer-residual"
-		}`)
+		v := objBuilder(t, func(b *variant.Builder, start int, fields *[]variant.FieldEntry) {
+			mustField(t, b, start, fields, "lat", (*variant.Builder).AppendFloat64, 10.5)
+			*fields = append(*fields, b.NextField(start, "user"))
+			userStart, userFields := b.Offset(), []variant.FieldEntry{}
+			mustField(t, b, userStart, &userFields, "email", (*variant.Builder).AppendString, "a@b.com")
+			mustField(t, b, userStart, &userFields, "id", (*variant.Builder).AppendInt, int64(42))
+			mustField(t, b, userStart, &userFields, "name", (*variant.Builder).AppendString, "Alice")
+			require.NoError(t, b.FinishObject(userStart, userFields))
+			mustField(t, b, start, fields, "misc", (*variant.Builder).AppendString, "kept-in-outer-residual")
+		})
 		res, err := internal.ShredVariant(v, schema)
 		require.NoError(t, err)
 
@@ -480,8 +625,14 @@ func TestBuildShreddedVariantArrayTopLevel(t *testing.T) {
 	}
 
 	rows := []variant.Value{
-		mustVariant(t, `{"lat": 10.5, "lng": -20.25}`),
-		mustVariant(t, `{"lat": 0.0, "extra": "metadata"}`),
+		objBuilder(t, func(b *variant.Builder, start int, fields *[]variant.FieldEntry) {
+			mustField(t, b, start, fields, "lat", (*variant.Builder).AppendFloat64, 10.5)
+			mustField(t, b, start, fields, "lng", (*variant.Builder).AppendFloat64, -20.25)
+		}),
+		objBuilder(t, func(b *variant.Builder, start int, fields *[]variant.FieldEntry) {
+			mustField(t, b, start, fields, "lat", (*variant.Builder).AppendFloat64, 0.0)
+			mustField(t, b, start, fields, "extra", (*variant.Builder).AppendString, "metadata")
+		}),
 		{}, // row 2 marked null below
 	}
 

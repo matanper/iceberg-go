@@ -100,7 +100,8 @@ const (
 	//                nested object access uses "$.a.b"; array elements use
 	//                "$.tags[]" (empty brackets — positional indexing
 	//                like "[0]" is rejected per the Parquet spec)
-	//   - <type>     is one of: boolean, int, long, float, double, string, binary
+	//   - <type>     is one of: boolean, int, long, float, double, string,
+	//                binary, date, uuid
 	//
 	// Examples:
 	//   "payload:$.lat:double, payload:$.user.email:string"
@@ -112,9 +113,26 @@ const (
 	// into per-row typed_value subfields per the Parquet Variant Shredding
 	// spec, leaving the residual variant in `value`.
 	//
-	// This mirrors apache/iceberg's write.parquet.shred-variants property
-	// flag, but takes explicit paths and types instead of running a buffered
-	// inference analyzer. See apache/iceberg-go#987.
+	// EXPERIMENTAL — Go-only mechanism. Apache iceberg-java does not yet
+	// have a path-list property; its equivalent feature is
+	// "write.parquet.shred-variants" (a boolean) which drives a buffered
+	// VariantShreddingAnalyzer that infers the shredded schema from
+	// sample rows. iceberg-go skips the analyzer in v1 and asks the user
+	// to declare paths explicitly. The property name and "<col>:<path>:<type>"
+	// syntax may change once apache/iceberg-go aligns with the upstream
+	// configuration shape (tracked in apache/iceberg-go#987).
+	//
+	// Behavioural divergence vs Java's reference writer:
+	//   - Lossless integer / float widening at extraction time
+	//     (e.g. variant int8 satisfies a "long" declaration). Java's
+	//     analyzer chooses one specific Parquet type and the writer
+	//     requires exact match.
+	//   - 9 of 14 spec primitives supported as leaf types
+	//     (boolean / int / long / float / double / string / binary /
+	//     date / uuid). time, timestamp / timestamptz, and decimal
+	//     (4 / 8 / 16) need richer property syntax for precision /
+	//     timezone / scale and are not yet recognized at extraction;
+	//     matching payloads fall back to per-path residual storage.
 	WriteVariantShreddingPathsKey = "write.variant.shredding-paths"
 
 	MinSnapshotsToKeepKey     = "min-snapshots-to-keep"

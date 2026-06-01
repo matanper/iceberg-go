@@ -24,11 +24,11 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/apache/iceberg-go"
+	"github.com/google/uuid"
 )
 
 // ShreddingPath declares one path-to-leaf in a shredding spec.
@@ -120,9 +120,19 @@ func (c *ShreddingConfig) Columns() []string {
 
 // shreddingTypeAliases maps the type names accepted in the
 // shredding-paths property to their Arrow DataType. The names match
-// Iceberg primitive names (boolean, int, long, float, double, string,
-// binary) so the property is portable across Java / pyiceberg /
-// iceberg-go.
+// Iceberg primitive names so the property is portable across
+// Java / pyiceberg / iceberg-go.
+//
+// Coverage relative to the 14 Parquet Variant Shredding spec
+// primitives (apache/parquet-format VariantShredding.md):
+//   - supported: boolean, int (int32), long (int64), float (float32),
+//     double (float64), string, binary, date (date32), uuid
+//   - not yet: time (time64), timestamp / timestamptz (timestamp
+//     variants with precision + timezone), decimal4 / decimal8 /
+//     decimal16 (precision-scale parameters require richer syntax).
+//     Variant payloads of these types fall through extractTyped and
+//     land in per-path residual storage so a downstream reader can
+//     still surface them.
 var shreddingTypeAliases = map[string]arrow.DataType{
 	"boolean": arrow.FixedWidthTypes.Boolean,
 	"int":     arrow.PrimitiveTypes.Int32,
@@ -131,6 +141,8 @@ var shreddingTypeAliases = map[string]arrow.DataType{
 	"double":  arrow.PrimitiveTypes.Float64,
 	"string":  arrow.BinaryTypes.String,
 	"binary":  arrow.BinaryTypes.Binary,
+	"date":    arrow.FixedWidthTypes.Date32,
+	"uuid":    extensions.NewUUIDType(),
 }
 
 // ParseShreddingPaths parses a write.variant.shredding-paths property
@@ -690,18 +702,21 @@ func childIndex(node *pathTree, key string) (int, bool) {
 
 // extractTyped tries to read v's payload as the declared Arrow type.
 // Returns (value, true) on a successful match and (nil, false) when
-// the variant's runtime type is incompatible (e.g. declared double
-// but payload is a string).
+// the variant's runtime type is incompatible (declared double but
+// payload is a string, declared long but payload is a decimal, etc.).
 //
-// The variant binary format stores integers in the smallest primitive
-// that fits (Int8/Int16/Int32/Int64) and may parse JSON-encoded
-// decimals as DecimalValue. We perform lossless widening
-// (Int8→Int32, Int8→Int64, Float32→Float64, Decimal→Float64) so a
-// user-friendly declaration like "double" or "long" matches the
-// payload regardless of which on-wire type the producer chose. Lossy
-// conversions (Float64→Float32, Int64→Int32 of an overflow value)
-// intentionally fall through to the residual path so no precision is
-// silently dropped.
+// Cross-kind coercions are deliberately refused — they would silently
+// drop precision (decimal→double) or hide overflow (int64→int32),
+// and Java's reference implementation rejects them outright
+// (DecimalPrimitiveWriter.canWrite / typed-writer-per-type dispatch).
+// Mismatched payloads instead flow into per-path residual storage so
+// a downstream reader still sees the original bytes.
+//
+// Lossless integer widening (Int8→Int32, Int8/Int16/Int32→Int64) is
+// performed because the variant binary format stores integers in the
+// smallest primitive that fits and Java's analyzer would have
+// produced the same widening at schema-inference time. Float32
+// values are widened to Float64 for the same reason.
 func extractTyped(v variant.Value, want arrow.DataType) (any, bool) {
 	raw := v.Value()
 	switch want.ID() {
@@ -740,9 +755,6 @@ func extractTyped(v variant.Value, want arrow.DataType) (any, bool) {
 		case float64:
 			return f, true
 		}
-		if d, ok := decimalAsFloat64(raw); ok {
-			return d, true
-		}
 	case arrow.STRING:
 		if s, ok := raw.(string); ok {
 			return s, true
@@ -751,28 +763,21 @@ func extractTyped(v variant.Value, want arrow.DataType) (any, bool) {
 		if bs, ok := raw.([]byte); ok {
 			return bs, true
 		}
+	case arrow.DATE32:
+		if d, ok := raw.(arrow.Date32); ok {
+			return d, true
+		}
+	case arrow.EXTENSION:
+		// UUID is the only variant-supported extension type today.
+		// variant.Value.Value() returns uuid.UUID for PrimitiveUUID.
+		if _, isUUID := want.(*extensions.UUIDType); isUUID {
+			if u, ok := raw.(uuid.UUID); ok {
+				return u, true
+			}
+		}
 	}
 
 	return nil, false
-}
-
-// decimalAsFloat64 converts a variant DecimalValue payload (any of
-// the 32/64/128-bit precisions) to float64. Returns (0, false) when
-// raw is not a DecimalValue. Note: 128-bit values exceeding float64's
-// 53-bit significand will round; callers concerned about precision
-// should declare a decimal-typed shredding column (v1 has none, so
-// such values fall back to residual storage).
-func decimalAsFloat64(raw any) (float64, bool) {
-	switch d := raw.(type) {
-	case variant.DecimalValue[decimal.Decimal32]:
-		return d.Value.ToFloat64(int32(d.Scale)), true
-	case variant.DecimalValue[decimal.Decimal64]:
-		return d.Value.ToFloat64(int32(d.Scale)), true
-	case variant.DecimalValue[decimal.Decimal128]:
-		return d.Value.ToFloat64(int32(d.Scale)), true
-	}
-
-	return 0, false
 }
 
 // ShreddingConfigFromSchema reverse-engineers a ShreddingConfig from a
@@ -1161,6 +1166,10 @@ func appendTypedValue(b array.Builder, v any) error {
 		tb.Append(v.(string))
 	case *array.BinaryBuilder:
 		tb.Append(v.([]byte))
+	case *array.Date32Builder:
+		tb.Append(v.(arrow.Date32))
+	case *extensions.UUIDBuilder:
+		tb.Append(v.(uuid.UUID))
 	default:
 		return fmt.Errorf("unsupported typed_value builder: %T", b)
 	}
