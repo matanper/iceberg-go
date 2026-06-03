@@ -16,11 +16,15 @@
 FROM tabulario/spark-iceberg:3.5.5_1.8.1
 
 RUN pip3 install -q ipython
-RUN pip3 install pyiceberg[s3fs,hive]
-RUN pip3 install pyarrow
+# Upgrade pyiceberg + pyarrow past what the base image bakes in. The base ships
+# pyiceberg 0.7 which predates the Iceberg v3 variant type; 0.11 reads the
+# spec'd shredded variant Parquet layout iceberg-go writes. pyarrow ≥20 lets
+# scripts walk the Parquet schema for cross-client structural assertions.
+RUN pip3 install -q --upgrade "pyiceberg[s3fs,hive]>=0.11" "pyarrow>=20"
 
 COPY provision.py .
 COPY validation.py .
+COPY validation_shredded_variant.py .
 COPY hadoop_validation.py .
 
 ENTRYPOINT ["./entrypoint.sh"]

@@ -21,6 +21,7 @@ package table_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -462,15 +463,14 @@ func (s *SparkIntegrationTestSuite) TestVariantWriteAndScan() {
 //  2. Reads through the iceberg-go scanner reassemble the shredded values
 //     back to a non-shredded VariantArray with the original payloads —
 //     shredding is invisible to consumers, matching Java's posture.
-//
-// A cross-client Spark read is NOT asserted here. Spark 3.5.5 / Iceberg 1.8.1
-// (the recipe image) cannot resolve the `variant` Iceberg type at all —
-// `IllegalArgumentException: Cannot parse type string to primitive: variant`
-// — so any SELECT against a variant-bearing table fails before the data is
-// touched. Bumping the recipe to Spark 4.x / Iceberg ≥ 1.10 is the prerequisite
-// for end-to-end cross-client variant testing in this suite; until then,
-// cross-client coverage lives in `testdata/shredded_variant_write/` for
-// pyiceberg / iceberg-java to read out-of-band.
+//  3. An independent client (pyiceberg + pyarrow) inside the recipe
+//     container loads the same snapshot from the REST catalog, opens the
+//     Parquet file directly, and confirms the typed_value sub-columns
+//     required by the Parquet Variant shredding spec are present. Spark
+//     can't be the cross-client reader yet — the recipe image is on
+//     Spark 3.5.5 / Iceberg 1.8.1, which can't even parse the `variant`
+//     Iceberg type — so we drop down to the pyiceberg/pyarrow layer for
+//     the same proof.
 func (s *SparkIntegrationTestSuite) TestVariantShreddingWriteAndScan() {
 	icebergSchema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
@@ -561,6 +561,21 @@ func (s *SparkIntegrationTestSuite) TestVariantShreddingWriteAndScan() {
 		s.Require().True(ok, "row %d: expected object after reassembly", i)
 		s.EqualValues(wantObj.NumElements(), gotObj.NumElements(), "row %d field count", i)
 	}
+
+	// (3) Cross-client check: pyarrow inside the recipe container opens
+	// the same Parquet file from MinIO directly and confirms it carries
+	// the spec'd shredded variant column layout. pyiceberg can't load
+	// the table itself yet — its REST TableResponse pydantic model still
+	// rejects `variant` field types as of 0.11.1 — so the cross-client
+	// proof is at the Parquet-file layer, not the catalog layer.
+	out, err := recipe.ExecuteSpark(s.T(), "./validation_shredded_variant.py",
+		"--data-file", dataFiles[0].FilePath(),
+		"--variant-column", "payload",
+		"--shredded-paths", "$.event_type,$.count",
+		"--expected-rows", strconv.Itoa(len(source)),
+	)
+	s.Require().NoError(err)
+	s.Require().Contains(out, "OK", "pyarrow validator output:\n%s", out)
 }
 
 func (s *SparkIntegrationTestSuite) TestOverwriteBasic() {
