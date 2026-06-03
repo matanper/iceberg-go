@@ -436,3 +436,203 @@ func mustBuildVariant(t *testing.T, v any) variant.Value {
 
 	return out
 }
+
+func TestParseShreddingSchema(t *testing.T) {
+	t.Run("empty spec returns empty schema", func(t *testing.T) {
+		s, err := internal.ParseShreddingSchema("")
+		require.NoError(t, err)
+		assert.True(t, s.IsEmpty())
+	})
+
+	t.Run("whitespace only returns empty schema", func(t *testing.T) {
+		s, err := internal.ParseShreddingSchema("   ")
+		require.NoError(t, err)
+		assert.True(t, s.IsEmpty())
+	})
+
+	t.Run("single typed path", func(t *testing.T) {
+		s, err := internal.ParseShreddingSchema("$.foo:long")
+		require.NoError(t, err)
+		require.False(t, s.IsEmpty())
+		tv := s.VariantType().TypedValue().Type
+		st, ok := tv.(*arrow.StructType)
+		require.True(t, ok, "typed_value should be a struct for object shredding")
+		require.Equal(t, 1, st.NumFields())
+		assert.Equal(t, "foo", st.Field(0).Name)
+	})
+
+	t.Run("multiple paths with mixed types", func(t *testing.T) {
+		s, err := internal.ParseShreddingSchema(" $.a:string , $.b:int , $.c:boolean ")
+		require.NoError(t, err)
+		require.False(t, s.IsEmpty())
+		assert.ElementsMatch(t, []string{"$.a", "$.b", "$.c"}, s.Paths())
+	})
+
+	t.Run("iceberg type aliases", func(t *testing.T) {
+		// 'integer' alias for int, 'bigint' alias for long, 'bool' for boolean.
+		_, err := internal.ParseShreddingSchema("$.a:integer,$.b:bigint,$.c:bool")
+		require.NoError(t, err)
+	})
+
+	t.Run("nested path", func(t *testing.T) {
+		s, err := internal.ParseShreddingSchema("$.src.ip:string")
+		require.NoError(t, err)
+		require.False(t, s.IsEmpty())
+	})
+
+	t.Run("rejects unknown type", func(t *testing.T) {
+		_, err := internal.ParseShreddingSchema("$.foo:bignumber")
+		require.ErrorContains(t, err, "unsupported variant shredding type")
+	})
+
+	t.Run("rejects malformed entry without separator", func(t *testing.T) {
+		_, err := internal.ParseShreddingSchema("$.foo")
+		require.ErrorContains(t, err, "<path>:<type>")
+	})
+
+	t.Run("rejects empty type after colon", func(t *testing.T) {
+		_, err := internal.ParseShreddingSchema("$.foo:")
+		require.ErrorContains(t, err, "<path>:<type>")
+	})
+
+	t.Run("rejects bad path", func(t *testing.T) {
+		_, err := internal.ParseShreddingSchema("foo:long")
+		require.ErrorContains(t, err, "must begin with '$'")
+	})
+
+	t.Run("rejects conflicting paths", func(t *testing.T) {
+		_, err := internal.ParseShreddingSchema("$.a:string,$.a.b:long")
+		require.ErrorContains(t, err, "conflicting paths")
+	})
+}
+
+// TestParquetWriter_DeclaredSchemaShredsEvenWhenFirstRowMissingPath
+// exercises the central reason for the declared-schema property: a path
+// declared in WriteVariantShreddingSchemaKey must be shredded even when
+// the first sample row doesn't carry that field. With the inference path
+// (WriteVariantShreddingPathsKey) the same input would drop the path
+// from the file's layout for everyone.
+func TestParquetWriter_DeclaredSchemaShredsEvenWhenFirstRowMissingPath(t *testing.T) {
+	ctx := context.Background()
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	icesc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	arrowSchema, err := table.SchemaToArrowSchema(icesc, nil, true, false)
+	require.NoError(t, err)
+
+	payBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer payBldr.Release()
+	// Row 0 deliberately omits "count" and "event_type" so the inference
+	// path would skip both. Later rows have them.
+	source := []variant.Value{
+		mustBuildVariant(t, map[string]any{"unrelated": "x"}),
+		mustBuildVariant(t, map[string]any{"event_type": "click", "count": int64(7)}),
+		mustBuildVariant(t, map[string]any{"event_type": "view", "count": int64(11)}),
+	}
+	for _, v := range source {
+		payBldr.Append(v)
+	}
+	payArr := payBldr.NewArray()
+	defer payArr.Release()
+
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{payArr}, int64(len(source)))
+	defer rec.Release()
+
+	declared, err := internal.ParseShreddingSchema("$.event_type:string,$.count:long")
+	require.NoError(t, err)
+	require.False(t, declared.IsEmpty())
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "declared.parquet")
+	_, err = fm.WriteDataFile(ctx, io.LocalFS{}, nil, internal.WriteFileInfo{
+		FileSchema:             icesc,
+		FileName:               path,
+		Spec:                   iceberg.PartitionSpec{},
+		WriteProps:             []parquet.WriterProperty{},
+		StatsCols:              shredStatsCols(icesc),
+		VariantShreddingSchema: declared,
+	}, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+
+	// On-disk: shredded with both declared typed_value sub-columns present.
+	rawArr := openVariantArray(t, path)
+	defer rawArr.Release()
+	require.True(t, rawArr.IsShredded(), "declared schema should produce a shredded layout")
+
+	tv := rawArr.Shredded().DataType().(*arrow.StructType)
+	require.Equal(t, 2, tv.NumFields(), "two declared fields → two typed_value sub-columns")
+	names := []string{tv.Field(0).Name, tv.Field(1).Name}
+	assert.ElementsMatch(t, []string{"event_type", "count"}, names,
+		"declared layout is independent of which fields the sample row contained")
+
+	// Round-trip: reassembled values match the source.
+	rdr, err := fm.Open(ctx, io.LocalFS{}, path)
+	require.NoError(t, err)
+	defer rdr.Close()
+	recs, err := rdr.GetRecords(ctx, allColumnIndices(t, path), nil)
+	require.NoError(t, err)
+	defer recs.Release()
+	require.True(t, recs.Next())
+	batch := recs.RecordBatch()
+	gotVarArr := lastVariantColumn(t, batch)
+	for i, want := range source {
+		got, err := gotVarArr.Value(i)
+		require.NoError(t, err, "row %d", i)
+		assertVariantStructurallyEqual(t, want, got)
+	}
+}
+
+// TestParquetWriter_DeclaredSchemaWinsOverPaths confirms that when both
+// properties are set, the declared schema is used (and the inferred paths
+// are ignored). This is the documented precedence.
+func TestParquetWriter_DeclaredSchemaWinsOverPaths(t *testing.T) {
+	ctx := context.Background()
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	icesc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	arrowSchema, err := table.SchemaToArrowSchema(icesc, nil, true, false)
+	require.NoError(t, err)
+
+	payBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer payBldr.Release()
+	payBldr.Append(mustBuildVariant(t, map[string]any{"a": int64(1), "b": "x"}))
+	payArr := payBldr.NewArray()
+	defer payArr.Release()
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{payArr}, 1)
+	defer rec.Release()
+
+	// Declared schema picks only `a`; inferred paths would also pick `b`.
+	declared, err := internal.ParseShreddingSchema("$.a:long")
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "precedence.parquet")
+	_, err = fm.WriteDataFile(ctx, io.LocalFS{}, nil, internal.WriteFileInfo{
+		FileSchema:             icesc,
+		FileName:               path,
+		Spec:                   iceberg.PartitionSpec{},
+		WriteProps:             []parquet.WriterProperty{},
+		StatsCols:              shredStatsCols(icesc),
+		VariantShreddingSchema: declared,
+		VariantShreddingPaths:  []string{"$.a", "$.b"},
+	}, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+
+	rawArr := openVariantArray(t, path)
+	defer rawArr.Release()
+	require.True(t, rawArr.IsShredded())
+	tv := rawArr.Shredded().DataType().(*arrow.StructType)
+	require.Equal(t, 1, tv.NumFields(),
+		"declared schema (1 field) must win over inferred paths (2 fields)")
+	assert.Equal(t, "a", tv.Field(0).Name)
+}

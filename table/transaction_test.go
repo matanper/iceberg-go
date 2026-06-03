@@ -578,6 +578,118 @@ func (s *SparkIntegrationTestSuite) TestVariantShreddingWriteAndScan() {
 	s.Require().Contains(out, "OK", "pyarrow validator output:\n%s", out)
 }
 
+// TestVariantShreddingDeclaredSchemaWriteAndScan mirrors
+// TestVariantShreddingWriteAndScan but uses WriteVariantShreddingSchemaKey
+// (declared types) instead of WriteVariantShreddingPathsKey (inference).
+//
+// The point of the declared mode is determinism: a path declared in the
+// schema must shred even when the first row of a file doesn't carry it.
+// This test exercises that — row 0 deliberately omits `count` and
+// `event_type` — and confirms the on-disk file still carries the typed
+// sub-columns and the pyarrow cross-client check still sees them.
+func (s *SparkIntegrationTestSuite) TestVariantShreddingDeclaredSchemaWriteAndScan() {
+	icebergSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	tbl, err := s.cat.CreateTable(
+		s.ctx,
+		catalog.ToIdentifier("default", "go_variant_shredded_declared_events"),
+		icebergSchema,
+		catalog.WithProperties(iceberg.Properties{
+			table.PropertyFormatVersion:          "3",
+			table.WriteVariantShreddingSchemaKey: "$.event_type:string,$.count:long",
+		}),
+	)
+	s.Require().NoError(err)
+
+	arrowSchema, err := table.SchemaToArrowSchema(icebergSchema, nil, true, false)
+	s.Require().NoError(err)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(s.T(), 0)
+
+	mkVariant := func(v any) variant.Value {
+		var b variant.Builder
+		s.Require().NoError(b.Append(v))
+		val, err := b.Build()
+		s.Require().NoError(err)
+
+		return val
+	}
+
+	idBldr := array.NewInt64Builder(mem)
+	defer idBldr.Release()
+	payBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer payBldr.Release()
+
+	source := []variant.Value{
+		// Row 0 has neither declared field → inference would skip both.
+		// Declared schema must still produce typed columns for them.
+		mkVariant(map[string]any{"unrelated": "ignore me"}),
+		mkVariant(map[string]any{"event_type": "click", "count": int64(7)}),
+		mkVariant(map[string]any{"event_type": "view", "count": int64(11)}),
+	}
+	for i, v := range source {
+		idBldr.Append(int64(i + 1))
+		payBldr.Append(v)
+	}
+
+	idArr := idBldr.NewInt64Array()
+	defer idArr.Release()
+	payArr := payBldr.NewArray()
+	defer payArr.Release()
+
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{idArr, payArr}, int64(len(source)))
+	defer rec.Release()
+	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.Record{rec})
+	defer arrTable.Release()
+
+	tx := tbl.NewTransaction()
+	s.Require().NoError(tx.AppendTable(s.ctx, arrTable, 2048, nil))
+	tbl, err = tx.Commit(s.ctx)
+	s.Require().NoError(err)
+
+	// (1) The on-disk file carries the declared shredded layout regardless
+	// of which fields the first row contained.
+	fs, err := tbl.FS(s.ctx)
+	s.Require().NoError(err)
+	dataFiles := collectVariantDataFiles(s.T(), s.ctx, tbl)
+	s.Require().Len(dataFiles, 1, "expected exactly one data file in this commit")
+	assertParquetVariantIsShredded(s.T(), s.ctx, fs, dataFiles[0])
+
+	// (2) Scanner-facing read reassembles to the source values, including
+	// row 0 (whose declared paths fell through to the residual value).
+	scanCtx := compute.WithAllocator(s.ctx, memory.DefaultAllocator)
+	results, err := tbl.Scan().ToArrowTable(scanCtx)
+	s.Require().NoError(err)
+	defer results.Release()
+
+	s.EqualValues(len(source), results.NumRows())
+	variantCol := results.Column(1).Data().Chunk(0).(*extensions.VariantArray)
+	s.False(variantCol.IsShredded())
+	for i, want := range source {
+		got, err := variantCol.Value(i)
+		s.Require().NoError(err, "row %d", i)
+		wantObj := want.Value().(variant.ObjectValue)
+		gotObj, ok := got.Value().(variant.ObjectValue)
+		s.Require().True(ok, "row %d: expected object after reassembly", i)
+		s.EqualValues(wantObj.NumElements(), gotObj.NumElements(), "row %d field count", i)
+	}
+
+	// (3) Cross-client: pyarrow sees both declared typed sub-columns even
+	// though row 0 didn't carry them.
+	out, err := recipe.ExecuteSpark(s.T(), "./validation_shredded_variant.py",
+		"--data-file", dataFiles[0].FilePath(),
+		"--variant-column", "payload",
+		"--shredded-paths", "$.event_type,$.count",
+		"--expected-rows", strconv.Itoa(len(source)),
+	)
+	s.Require().NoError(err)
+	s.Require().Contains(out, "OK", "pyarrow validator output:\n%s", out)
+}
+
 func (s *SparkIntegrationTestSuite) TestOverwriteBasic() {
 	icebergSchema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.Bool},
