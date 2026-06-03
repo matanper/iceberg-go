@@ -31,6 +31,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/apache/iceberg-go"
@@ -451,6 +452,117 @@ func (s *SparkIntegrationTestSuite) TestVariantWriteAndScan() {
 	s.EqualValues(3, arrVal.Len())
 }
 
+// TestVariantShreddingWriteAndScan exercises the full transaction-driven
+// write path with `write.variant.shredding-paths` configured. The end-to-end
+// guarantees we want:
+//
+//  1. iceberg-go's rolling writer accepts the property, infers typed_value
+//     leaf types from the first batch, and produces files whose variant
+//     columns the on-disk Parquet metadata reports as shredded.
+//  2. Reads through the iceberg-go scanner reassemble the shredded values
+//     back to a non-shredded VariantArray with the original payloads —
+//     shredding is invisible to consumers, matching Java's posture.
+//
+// A cross-client Spark read is NOT asserted here. Spark 3.5.5 / Iceberg 1.8.1
+// (the recipe image) cannot resolve the `variant` Iceberg type at all —
+// `IllegalArgumentException: Cannot parse type string to primitive: variant`
+// — so any SELECT against a variant-bearing table fails before the data is
+// touched. Bumping the recipe to Spark 4.x / Iceberg ≥ 1.10 is the prerequisite
+// for end-to-end cross-client variant testing in this suite; until then,
+// cross-client coverage lives in `testdata/shredded_variant_write/` for
+// pyiceberg / iceberg-java to read out-of-band.
+func (s *SparkIntegrationTestSuite) TestVariantShreddingWriteAndScan() {
+	icebergSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	tbl, err := s.cat.CreateTable(
+		s.ctx,
+		catalog.ToIdentifier("default", "go_variant_shredded_events"),
+		icebergSchema,
+		catalog.WithProperties(iceberg.Properties{
+			table.PropertyFormatVersion:         "3",
+			table.WriteVariantShreddingPathsKey: "$.event_type,$.count",
+		}),
+	)
+	s.Require().NoError(err)
+
+	arrowSchema, err := table.SchemaToArrowSchema(icebergSchema, nil, true, false)
+	s.Require().NoError(err)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(s.T(), 0)
+
+	mkVariant := func(v any) variant.Value {
+		var b variant.Builder
+		s.Require().NoError(b.Append(v))
+		val, err := b.Build()
+		s.Require().NoError(err)
+
+		return val
+	}
+
+	idBldr := array.NewInt64Builder(mem)
+	defer idBldr.Release()
+	payBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer payBldr.Release()
+
+	source := []variant.Value{
+		mkVariant(map[string]any{"event_type": "click", "count": int64(7), "extra": "drop-me"}),
+		mkVariant(map[string]any{"event_type": "view", "count": int64(11)}),
+		// event_type missing — the typed column for that field is null
+		// for this row; the rest stays in the residual value column.
+		mkVariant(map[string]any{"count": int64(3), "note": "no event_type here"}),
+	}
+	for i, v := range source {
+		idBldr.Append(int64(i + 1))
+		payBldr.Append(v)
+	}
+
+	idArr := idBldr.NewInt64Array()
+	defer idArr.Release()
+	payArr := payBldr.NewArray()
+	defer payArr.Release()
+
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{idArr, payArr}, int64(len(source)))
+	defer rec.Release()
+	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.Record{rec})
+	defer arrTable.Release()
+
+	tx := tbl.NewTransaction()
+	s.Require().NoError(tx.AppendTable(s.ctx, arrTable, 2048, nil))
+	tbl, err = tx.Commit(s.ctx)
+	s.Require().NoError(err)
+
+	// (1) Inspect the manifested Parquet file directly and confirm the
+	// variant column is shredded on disk.
+	fs, err := tbl.FS(s.ctx)
+	s.Require().NoError(err)
+	dataFiles := collectVariantDataFiles(s.T(), s.ctx, tbl)
+	s.Require().Len(dataFiles, 1, "expected exactly one data file in this commit")
+	assertParquetVariantIsShredded(s.T(), s.ctx, fs, dataFiles[0])
+
+	// (2) Scanner-facing read reassembles to non-shredded values.
+	scanCtx := compute.WithAllocator(s.ctx, memory.DefaultAllocator)
+	results, err := tbl.Scan().ToArrowTable(scanCtx)
+	s.Require().NoError(err)
+	defer results.Release()
+
+	s.EqualValues(len(source), results.NumRows())
+	variantCol := results.Column(1).Data().Chunk(0).(*extensions.VariantArray)
+	s.False(variantCol.IsShredded(), "scanner should expose a non-shredded variant column")
+
+	for i, want := range source {
+		got, err := variantCol.Value(i)
+		s.Require().NoError(err, "row %d", i)
+		wantObj := want.Value().(variant.ObjectValue)
+		gotObj, ok := got.Value().(variant.ObjectValue)
+		s.Require().True(ok, "row %d: expected object after reassembly", i)
+		s.EqualValues(wantObj.NumElements(), gotObj.NumElements(), "row %d field count", i)
+	}
+}
+
 func (s *SparkIntegrationTestSuite) TestOverwriteBasic() {
 	icebergSchema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.Bool},
@@ -767,4 +879,55 @@ func (s *SparkIntegrationTestSuite) TestDeleteMergeOnReadPartitioned() {
 
 func TestSparkIntegration(t *testing.T) {
 	suite.Run(t, new(SparkIntegrationTestSuite))
+}
+
+// collectVariantDataFiles returns every committed data file in tbl's current
+// snapshot. Test helper for variant integration tests where we want to crack
+// open the produced Parquet to confirm the variant layout.
+func collectVariantDataFiles(t *testing.T, ctx context.Context, tbl *table.Table) []iceberg.DataFile {
+	t.Helper()
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatalf("PlanFiles: %v", err)
+	}
+	out := make([]iceberg.DataFile, 0, len(tasks))
+	for _, task := range tasks {
+		out = append(out, task.File)
+	}
+
+	return out
+}
+
+// assertParquetVariantIsShredded opens df on the catalog's file system and
+// asserts that its variant column carries a shredded layout (a typed_value
+// sub-column). The check inspects the Parquet schema so it doesn't depend on
+// Spark/Iceberg-side variant decoding.
+func assertParquetVariantIsShredded(t *testing.T, ctx context.Context, fs iceio.IO, df iceberg.DataFile) {
+	t.Helper()
+	f, err := fs.Open(df.FilePath())
+	if err != nil {
+		t.Fatalf("open data file %s: %v", df.FilePath(), err)
+	}
+	defer f.Close()
+
+	rdr, err := file.NewParquetReader(f)
+	if err != nil {
+		t.Fatalf("parquet open %s: %v", df.FilePath(), err)
+	}
+	defer rdr.Close()
+
+	sc := rdr.MetaData().Schema
+	found := false
+	for i := 0; i < sc.NumColumns(); i++ {
+		path := sc.Column(i).Path()
+		if strings.Contains(path, ".typed_value") {
+			found = true
+
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a shredded variant column in %s, got Parquet schema %s",
+			df.FilePath(), sc.String())
+	}
 }
