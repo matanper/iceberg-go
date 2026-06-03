@@ -123,6 +123,12 @@ type WriteFileInfo struct {
 	Content          iceberg.ManifestEntryContent
 	EqualityFieldIDs []int
 	SortOrderID      int
+
+	// VariantShreddingPaths is the parsed `write.variant.shredding-paths`
+	// table property — the $.path expressions used to decide which variant
+	// fields are shredded into typed columns. Empty means no shredding,
+	// mirroring Java's default posture.
+	VariantShreddingPaths []string
 }
 
 type tablePropertiesContextKey struct{}

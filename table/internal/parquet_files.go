@@ -33,6 +33,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
@@ -326,14 +327,38 @@ func (p parquetFormat) WriteDataFile(ctx context.Context, fs iceio.WriteFileIO, 
 // ParquetFileWriter is an incremental single-file writer with open/write/close
 // lifecycle. It writes Arrow record batches to a Parquet file and tracks bytes
 // written for rolling file decisions.
+//
+// When VariantShreddingPaths is set on info and the schema has variant
+// columns, opening the underlying pqarrow.FileWriter is deferred until the
+// first Write call: the leaf Arrow types for each shredded path are inferred
+// from that batch's first non-null variant value, then the writer is opened
+// against the rewritten schema.
 type ParquetFileWriter struct {
-	pqWriter   *pqarrow.FileWriter
 	counter    *internal.CountingWriter
 	fileCloser io.Closer
 	format     parquetFormat
 	info       WriteFileInfo
 	partition  map[int]any
 	colMapping map[string]int
+
+	mem         memory.Allocator
+	writerProps *parquet.WriterProperties
+	arrProps    pqarrow.ArrowWriterProperties
+	arrowSchema *arrow.Schema
+
+	// pqWriter is opened eagerly when no variant shredding is needed, or
+	// lazily on first Write when shredding requires inferring leaf types
+	// from a sample batch.
+	pqWriter *pqarrow.FileWriter
+
+	// shreddingPaths is the parsed property; non-empty means we may need
+	// to shred one or more variant columns in this file.
+	shreddingPaths []string
+
+	// shredSchemas is keyed by variant column index in arrowSchema. Once a
+	// column's typed_value layout has been inferred (or definitively skipped),
+	// the schema is cached here so subsequent batches reuse it.
+	shredSchemas map[int]ShreddingSchema
 }
 
 // NewFileWriter creates a ParquetFileWriter that writes batches to a single
@@ -359,27 +384,192 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 	writerProps := parquet.NewWriterProperties(info.WriteProps.([]parquet.WriterProperty)...)
 	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
 
-	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, writerProps, arrProps)
-	if err != nil {
-		fw.Close()
-
-		return nil, err
+	pfw := &ParquetFileWriter{
+		counter:        counter,
+		fileCloser:     fw,
+		format:         p,
+		info:           info,
+		partition:      partitionValues,
+		colMapping:     colMapping,
+		mem:            mem,
+		writerProps:    writerProps,
+		arrProps:       arrProps,
+		arrowSchema:    arrowSchema,
+		shreddingPaths: info.VariantShreddingPaths,
 	}
 
-	return &ParquetFileWriter{
-		pqWriter:   writer,
-		counter:    counter,
-		fileCloser: fw,
-		format:     p,
-		info:       info,
-		partition:  partitionValues,
-		colMapping: colMapping,
-	}, nil
+	if !pfw.willShred() {
+		writer, err := pqarrow.NewFileWriter(arrowSchema, counter, writerProps, arrProps)
+		if err != nil {
+			fw.Close()
+
+			return nil, err
+		}
+		pfw.pqWriter = writer
+	}
+
+	return pfw, nil
 }
 
-// Write appends a record batch to the Parquet file.
+// willShred reports whether the writer needs to defer pqWriter creation to
+// run variant shredding. True only when shredding paths are configured AND
+// the inbound schema has at least one non-shredded variant column.
+func (w *ParquetFileWriter) willShred() bool {
+	if len(w.shreddingPaths) == 0 {
+		return false
+	}
+	for _, f := range w.arrowSchema.Fields() {
+		if isNonShreddedVariantField(f) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isNonShreddedVariantField reports whether f is a `parquet.variant`
+// extension type that hasn't already been given a typed_value layout.
+func isNonShreddedVariantField(f arrow.Field) bool {
+	ext, ok := f.Type.(arrow.ExtensionType)
+	if !ok || ext.ExtensionName() != "parquet.variant" {
+		return false
+	}
+	vt, ok := ext.(*extensions.VariantType)
+	if !ok {
+		return false
+	}
+
+	return vt.TypedValue().Type == nil
+}
+
+// Write appends a record batch to the Parquet file. On the first call when
+// shredding is configured, it inspects the batch to pick a typed_value layout
+// per variant column, opens the pqarrow.FileWriter with the rewritten schema,
+// and from then on transforms every batch's variant columns to the shredded
+// representation.
 func (w *ParquetFileWriter) Write(batch arrow.RecordBatch) error {
-	return w.pqWriter.WriteBuffered(batch)
+	if w.pqWriter == nil {
+		if err := w.openWithShredding(batch); err != nil {
+			return err
+		}
+	}
+	if len(w.shredSchemas) == 0 {
+		return w.pqWriter.WriteBuffered(batch)
+	}
+
+	shredded, err := w.shredBatch(batch)
+	if err != nil {
+		return err
+	}
+	defer shredded.Release()
+
+	return w.pqWriter.WriteBuffered(shredded)
+}
+
+// openWithShredding inspects sample to infer typed_value layouts for each
+// variant column, rewrites arrowSchema accordingly, and opens the underlying
+// pqarrow.FileWriter. The inferred schemas are cached on w for the lifetime
+// of the writer.
+func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
+	w.shredSchemas = make(map[int]ShreddingSchema)
+	fields := w.arrowSchema.Fields()
+	rewritten := make([]arrow.Field, len(fields))
+	copy(rewritten, fields)
+
+	for i, f := range fields {
+		if !isNonShreddedVariantField(f) {
+			continue
+		}
+		varr, ok := sample.Column(i).(*extensions.VariantArray)
+		if !ok {
+			continue
+		}
+		schema, err := inferColumnSchema(w.shreddingPaths, varr)
+		if err != nil {
+			return fmt.Errorf("variant shredding column %q: %w", f.Name, err)
+		}
+		if schema.IsEmpty() {
+			continue
+		}
+		w.shredSchemas[i] = schema
+		rewritten[i] = arrow.Field{
+			Name:     f.Name,
+			Type:     schema.VariantType(),
+			Nullable: f.Nullable,
+			Metadata: f.Metadata,
+		}
+	}
+
+	md := w.arrowSchema.Metadata()
+	w.arrowSchema = arrow.NewSchema(rewritten, &md)
+	writer, err := pqarrow.NewFileWriter(w.arrowSchema, w.counter, w.writerProps, w.arrProps)
+	if err != nil {
+		return err
+	}
+	w.pqWriter = writer
+
+	return nil
+}
+
+// inferColumnSchema picks a ShreddingSchema by scanning the column for the
+// first non-null variant value and inferring leaf Arrow types from it.
+// Returns an empty schema (no shredding for this column) when the column has
+// no inferable values.
+func inferColumnSchema(paths []string, arr *extensions.VariantArray) (ShreddingSchema, error) {
+	for i := 0; i < arr.Len(); i++ {
+		if arr.IsNull(i) {
+			continue
+		}
+		v, err := arr.Value(i)
+		if err != nil {
+			return ShreddingSchema{}, fmt.Errorf("reading sample row %d: %w", i, err)
+		}
+
+		return InferShreddingSchema(paths, v)
+	}
+
+	return ShreddingSchema{}, nil
+}
+
+// shredBatch returns a record batch where each variant column in shredSchemas
+// has been replaced by its shredded *extensions.VariantArray. Other columns
+// are passed through unchanged. Caller owns Release on the returned batch.
+func (w *ParquetFileWriter) shredBatch(batch arrow.RecordBatch) (arrow.RecordBatch, error) {
+	cols := make([]arrow.Array, batch.NumCols())
+	for i := range cols {
+		cols[i] = batch.Column(i)
+		cols[i].Retain()
+	}
+
+	var firstErr error
+	for idx, schema := range w.shredSchemas {
+		varr, ok := cols[idx].(*extensions.VariantArray)
+		if !ok {
+			continue
+		}
+		shredded, err := ShredVariantArray(varr, schema, w.mem)
+		if err != nil {
+			firstErr = err
+
+			break
+		}
+		cols[idx].Release()
+		cols[idx] = shredded
+	}
+	if firstErr != nil {
+		for _, c := range cols {
+			c.Release()
+		}
+
+		return nil, firstErr
+	}
+
+	out := array.NewRecordBatch(w.arrowSchema, cols, batch.NumRows())
+	for _, c := range cols {
+		c.Release()
+	}
+
+	return out, nil
 }
 
 // BytesWritten returns the number of bytes flushed to the output so far.
@@ -391,6 +581,16 @@ func (w *ParquetFileWriter) BytesWritten() int64 {
 // accurate file statistics and size.
 func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 	defer internal.CheckedClose(w.fileCloser, &err)
+
+	if w.pqWriter == nil {
+		// No batches were written — open against the original schema so we
+		// produce a valid (empty) Parquet file rather than an empty stream.
+		writer, openErr := pqarrow.NewFileWriter(w.arrowSchema, w.counter, w.writerProps, w.arrProps)
+		if openErr != nil {
+			return nil, openErr
+		}
+		w.pqWriter = writer
+	}
 
 	if err = w.pqWriter.Close(); err != nil {
 		return nil, err

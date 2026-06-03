@@ -61,6 +61,13 @@ const (
 	ParquetBatchSizeKey     = internal.ParquetBatchSizeKey
 	ParquetBatchSizeDefault = internal.ParquetBatchSizeDefault
 
+	// WriteVariantShreddingPathsKey is the comma-separated list of
+	// $.path expressions that select variant fields to shred at write
+	// time. Matches the same property name in iceberg-java. Empty
+	// (default) means no shredding — both clients agree the safe
+	// posture is to never shred unless explicitly configured.
+	WriteVariantShreddingPathsKey = internal.WriteVariantShreddingPathsKey
+
 	ManifestMergeEnabledKey     = "commit.manifest-merge.enabled"
 	ManifestMergeEnabledDefault = false
 
