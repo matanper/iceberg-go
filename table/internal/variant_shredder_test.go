@@ -19,6 +19,7 @@ package internal_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -27,6 +28,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/io"
@@ -635,4 +638,235 @@ func TestParquetWriter_DeclaredSchemaWinsOverPaths(t *testing.T) {
 	require.Equal(t, 1, tv.NumFields(),
 		"declared schema (1 field) must win over inferred paths (2 fields)")
 	assert.Equal(t, "a", tv.Field(0).Name)
+}
+
+func TestParseShreddingSchemasByColumn(t *testing.T) {
+	t.Run("no matching keys returns empty map", func(t *testing.T) {
+		got, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+			"unrelated.property":             "value",
+			"write.variant.shredding-paths":  "$.foo",
+			"write.variant.shredding-schema": "$.bar:long",
+		})
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("parses per-column entries", func(t *testing.T) {
+		got, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+			"write.variant.shredding-schema.column.event": "$.event_type:string,$.count:long",
+			"write.variant.shredding-schema.column.audit": "$.actor:string",
+			"unrelated": "x",
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+		assert.ElementsMatch(t, []string{"$.event_type", "$.count"}, got["event"].Paths())
+		assert.ElementsMatch(t, []string{"$.actor"}, got["audit"].Paths())
+	})
+
+	t.Run("ignores empty column name", func(t *testing.T) {
+		// "write.variant.shredding-schema.column." with no name is a
+		// malformed key; should be ignored, not error, since arbitrary
+		// other tables may have similarly-prefixed properties.
+		got, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+			"write.variant.shredding-schema.column.": "$.foo:long",
+		})
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("empty value produces no entry", func(t *testing.T) {
+		got, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+			"write.variant.shredding-schema.column.event": "",
+		})
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("surfaces parser error with column context", func(t *testing.T) {
+		_, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+			"write.variant.shredding-schema.column.event": "$.foo:bignumber",
+		})
+		require.ErrorContains(t, err, `column "event"`)
+		require.ErrorContains(t, err, "unsupported variant shredding type")
+	})
+}
+
+// TestParquetWriter_PerColumnSchemaShredsOnlyTargetedColumn proves the
+// motivating use case for the per-column property: a table with multiple
+// variant columns where only one is structurally typed (e.g. `event`)
+// and the rest are free-form maps (e.g. `tags`). A per-column schema
+// keyed on `event` must shred that column and leave `tags` non-shredded.
+func TestParquetWriter_PerColumnSchemaShredsOnlyTargetedColumn(t *testing.T) {
+	ctx := context.Background()
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	icesc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "event", Type: iceberg.VariantType{}},
+		iceberg.NestedField{ID: 2, Name: "tags", Type: iceberg.VariantType{}},
+	)
+	arrowSchema, err := table.SchemaToArrowSchema(icesc, nil, true, false)
+	require.NoError(t, err)
+
+	eventBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer eventBldr.Release()
+	tagsBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer tagsBldr.Release()
+
+	eventBldr.Append(mustBuildVariant(t, map[string]any{"event_type": "click", "count": int64(7)}))
+	tagsBldr.Append(mustBuildVariant(t, map[string]any{"customer": "acme", "region": "us-west"}))
+
+	eventArr := eventBldr.NewArray()
+	defer eventArr.Release()
+	tagsArr := tagsBldr.NewArray()
+	defer tagsArr.Release()
+
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{eventArr, tagsArr}, 1)
+	defer rec.Release()
+
+	schemas, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+		internal.WriteVariantShreddingSchemaColumnPrefix + ".event": "$.event_type:string,$.count:long",
+	})
+	require.NoError(t, err)
+	require.Len(t, schemas, 1)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "per_column.parquet")
+	_, err = fm.WriteDataFile(ctx, io.LocalFS{}, nil, internal.WriteFileInfo{
+		FileSchema:                      icesc,
+		FileName:                        path,
+		Spec:                            iceberg.PartitionSpec{},
+		WriteProps:                      []parquet.WriterProperty{},
+		StatsCols:                       shredStatsCols(icesc),
+		VariantShreddingSchemasByColumn: schemas,
+	}, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+
+	eventArrOnDisk := variantColByName(t, path, "event")
+	defer eventArrOnDisk.Release()
+	assert.True(t, eventArrOnDisk.IsShredded(),
+		"`event` column must shred (it has a per-column schema)")
+
+	tagsArrOnDisk := variantColByName(t, path, "tags")
+	defer tagsArrOnDisk.Release()
+	assert.False(t, tagsArrOnDisk.IsShredded(),
+		"`tags` column must NOT shred (no per-column schema, no global schema, no paths)")
+}
+
+// TestParquetWriter_PerColumnSchemaOverridesGlobalForThatColumn proves
+// precedence: a per-column schema applies to its target column; the
+// table-global schema covers everything else.
+func TestParquetWriter_PerColumnSchemaOverridesGlobalForThatColumn(t *testing.T) {
+	ctx := context.Background()
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	icesc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "event", Type: iceberg.VariantType{}},
+		iceberg.NestedField{ID: 2, Name: "audit", Type: iceberg.VariantType{}},
+	)
+	arrowSchema, err := table.SchemaToArrowSchema(icesc, nil, true, false)
+	require.NoError(t, err)
+
+	eventBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer eventBldr.Release()
+	auditBldr := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer auditBldr.Release()
+
+	eventBldr.Append(mustBuildVariant(t, map[string]any{"event_type": "click"}))
+	auditBldr.Append(mustBuildVariant(t, map[string]any{"actor": "system"}))
+
+	eventArr := eventBldr.NewArray()
+	defer eventArr.Release()
+	auditArr := auditBldr.NewArray()
+	defer auditArr.Release()
+
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{eventArr, auditArr}, 1)
+	defer rec.Release()
+
+	global, err := internal.ParseShreddingSchema("$.actor:string")
+	require.NoError(t, err)
+	perColumn, err := internal.ParseShreddingSchemasByColumn(map[string]string{
+		internal.WriteVariantShreddingSchemaColumnPrefix + ".event": "$.event_type:string",
+	})
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "override.parquet")
+	_, err = fm.WriteDataFile(ctx, io.LocalFS{}, nil, internal.WriteFileInfo{
+		FileSchema:                      icesc,
+		FileName:                        path,
+		Spec:                            iceberg.PartitionSpec{},
+		WriteProps:                      []parquet.WriterProperty{},
+		StatsCols:                       shredStatsCols(icesc),
+		VariantShreddingSchema:          global,
+		VariantShreddingSchemasByColumn: perColumn,
+	}, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+
+	eventArrOnDisk := variantColByName(t, path, "event")
+	defer eventArrOnDisk.Release()
+	require.True(t, eventArrOnDisk.IsShredded())
+	eventTV := eventArrOnDisk.Shredded().DataType().(*arrow.StructType)
+	require.Equal(t, 1, eventTV.NumFields())
+	assert.Equal(t, "event_type", eventTV.Field(0).Name,
+		"`event` column must use per-column schema, not global")
+
+	auditArrOnDisk := variantColByName(t, path, "audit")
+	defer auditArrOnDisk.Release()
+	require.True(t, auditArrOnDisk.IsShredded())
+	auditTV := auditArrOnDisk.Shredded().DataType().(*arrow.StructType)
+	require.Equal(t, 1, auditTV.NumFields())
+	assert.Equal(t, "actor", auditTV.Field(0).Name,
+		"`audit` column has no per-column schema, must fall back to global")
+}
+
+// variantColByName opens a Parquet fixture and returns the VariantArray
+// for the named top-level column. Multi-variant tests use this to assert
+// per-column shredding decisions independently. Caller owns Release.
+func variantColByName(t *testing.T, path, name string) *extensions.VariantArray {
+	t.Helper()
+	tbl := readArrowTable(t, path)
+	idx := -1
+	for i, f := range tbl.Schema().Fields() {
+		if f.Name == name {
+			idx = i
+
+			break
+		}
+	}
+	require.GreaterOrEqual(t, idx, 0, "column %q not found in %s", name, path)
+	chunk := tbl.Column(idx).Data().Chunk(0)
+	v, ok := chunk.(*extensions.VariantArray)
+	require.True(t, ok, "column %q is %T, not VariantArray", name, chunk)
+	v.Retain()
+
+	return v
+}
+
+// readArrowTable opens a Parquet fixture via raw pqarrow and returns the
+// full arrow.Table. The table is released on test cleanup so callers can
+// hold references to its chunks for the duration of the test.
+func readArrowTable(t *testing.T, path string) arrow.Table {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err, "open %s", path)
+	t.Cleanup(func() { _ = f.Close() })
+
+	reader, err := file.NewParquetReader(f)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reader.Close() })
+
+	arrReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+
+	tbl, err := arrReader.ReadTable(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(tbl.Release)
+
+	return tbl
 }
