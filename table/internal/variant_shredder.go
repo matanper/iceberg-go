@@ -55,9 +55,25 @@ const WriteVariantShreddingPathsKey = "write.variant.shredding-paths"
 // `long`, `float`, `double`, `string`, `binary`, `date`, `timestamp`,
 // `timestamptz`. Decimal and other types can be added as needed.
 //
-// Single global property — the same declared schema applies to every variant
-// column in the table. Per-column scoping is a future extension.
+// This is a table-global key: the same declared schema applies to every
+// variant column. For tables with semantically heterogeneous variant
+// columns (e.g. a fixed-shape `event` plus open-ended `tags`), use
+// [WriteVariantShreddingSchemaColumnPrefix] to scope the schema to one
+// column without touching the others.
 const WriteVariantShreddingSchemaKey = "write.variant.shredding-schema"
+
+// WriteVariantShreddingSchemaColumnPrefix is the per-column form of
+// [WriteVariantShreddingSchemaKey]. The full property key is formed by
+// appending ".<column-name>", e.g.
+//
+//	write.variant.shredding-schema.column.event = $.event_type:string,$.count:long
+//
+// matches the same `.column.<name>` suffix convention used by
+// `write.parquet.bloom-filter-enabled.column.<name>` and other per-column
+// Iceberg properties. When both this key and the global
+// [WriteVariantShreddingSchemaKey] are set, the per-column key wins for
+// that column; the global continues to apply to any other variant column.
+const WriteVariantShreddingSchemaColumnPrefix = "write.variant.shredding-schema.column"
 
 // ShreddingSchema describes the typed-column layout for one variant column.
 // Build via InferShreddingSchema (paths + a sample value), or BuildShreddingSchema
@@ -153,6 +169,37 @@ func ParseShreddingSchema(spec string) (ShreddingSchema, error) {
 	}
 
 	return BuildShreddingSchema(paths, types)
+}
+
+// ParseShreddingSchemasByColumn scans props for entries whose key matches
+// [WriteVariantShreddingSchemaColumnPrefix].<column-name> and parses each
+// value into a per-column ShreddingSchema, keyed by the column name.
+//
+// Empty / unparseable values are surfaced as errors so misconfigured
+// property keys fail fast at table-reconcile time. Entries that parse to
+// IsEmpty() are dropped (treated as "no override for that column").
+//
+// Returns a non-nil map even when no per-column keys are present so callers
+// can use a uniform lookup.
+func ParseShreddingSchemasByColumn(props map[string]string) (map[string]ShreddingSchema, error) {
+	out := make(map[string]ShreddingSchema)
+	prefix := WriteVariantShreddingSchemaColumnPrefix + "."
+	for key, val := range props {
+		colName, ok := strings.CutPrefix(key, prefix)
+		if !ok || colName == "" {
+			continue
+		}
+		schema, err := ParseShreddingSchema(val)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"variant shredding schema for column %q: %w", colName, err)
+		}
+		if !schema.IsEmpty() {
+			out[colName] = schema
+		}
+	}
+
+	return out, nil
 }
 
 // icebergTypeNameToArrow maps an Iceberg primitive type name to the Arrow

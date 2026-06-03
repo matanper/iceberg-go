@@ -78,7 +78,21 @@ const (
 	// `$.event_type:string,$.count:long,$.src.ip:string`. Skips
 	// per-file inference entirely so every file uses the same shredded
 	// layout. Takes precedence over [WriteVariantShreddingPathsKey].
+	//
+	// This is table-global — the same schema applies to every variant
+	// column in the table. Use [WriteVariantShreddingSchemaColumnPrefix]
+	// to scope a schema to one variant column.
 	WriteVariantShreddingSchemaKey = internal.WriteVariantShreddingSchemaKey
+
+	// WriteVariantShreddingSchemaColumnPrefix is the per-column form of
+	// [WriteVariantShreddingSchemaKey]. The full key is formed by
+	// appending ".<column-name>", e.g.
+	//
+	//	write.variant.shredding-schema.column.event = $.event_type:string,$.count:long
+	//
+	// When both this key and the global key are set, the per-column key
+	// wins for that column; the global continues to apply elsewhere.
+	WriteVariantShreddingSchemaColumnPrefix = internal.WriteVariantShreddingSchemaColumnPrefix
 
 	ManifestMergeEnabledKey     = "commit.manifest-merge.enabled"
 	ManifestMergeEnabledDefault = false

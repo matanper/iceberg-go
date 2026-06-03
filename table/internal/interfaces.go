@@ -138,6 +138,14 @@ type WriteFileInfo struct {
 	// applies this exact typed_value layout to every variant column in the
 	// file — no per-file type inference, no first-row dependence.
 	VariantShreddingSchema ShreddingSchema
+
+	// VariantShreddingSchemasByColumn carries per-column overrides parsed
+	// from `write.variant.shredding-schema.column.<name>` keys. When a
+	// variant column's name appears as a key here, that schema is used
+	// instead of VariantShreddingSchema, so heterogeneous tables (e.g. a
+	// fixed-shape `event` column alongside open-ended `tags`) can shred
+	// the structured column without polluting the free-form ones.
+	VariantShreddingSchemasByColumn map[string]ShreddingSchema
 }
 
 type tablePropertiesContextKey struct{}

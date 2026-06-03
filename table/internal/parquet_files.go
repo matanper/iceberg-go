@@ -354,12 +354,20 @@ type ParquetFileWriter struct {
 
 	// shreddingSchema is the declared schema parsed from
 	// write.variant.shredding-schema. When non-empty, applies to every
-	// variant column in the file and pre-empts shreddingPaths.
+	// variant column in the file (unless overridden by
+	// shreddingSchemasByColumn for a specific column) and pre-empts
+	// shreddingPaths.
 	shreddingSchema ShreddingSchema
+
+	// shreddingSchemasByColumn are per-column declared schemas parsed from
+	// write.variant.shredding-schema.column.<name>. A column whose name
+	// appears here uses the override; columns not listed fall back to
+	// shreddingSchema, then shreddingPaths.
+	shreddingSchemasByColumn map[string]ShreddingSchema
 
 	// shreddingPaths is the parsed property; non-empty means we may need
 	// to shred one or more variant columns in this file using first-row
-	// inference. Ignored when shreddingSchema is non-empty.
+	// inference. Ignored when a declared schema applies.
 	shreddingPaths []string
 
 	// shredSchemas is keyed by variant column index in arrowSchema. Once a
@@ -392,18 +400,19 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
 
 	pfw := &ParquetFileWriter{
-		counter:         counter,
-		fileCloser:      fw,
-		format:          p,
-		info:            info,
-		partition:       partitionValues,
-		colMapping:      colMapping,
-		mem:             mem,
-		writerProps:     writerProps,
-		arrProps:        arrProps,
-		arrowSchema:     arrowSchema,
-		shreddingSchema: info.VariantShreddingSchema,
-		shreddingPaths:  info.VariantShreddingPaths,
+		counter:                  counter,
+		fileCloser:               fw,
+		format:                   p,
+		info:                     info,
+		partition:                partitionValues,
+		colMapping:               colMapping,
+		mem:                      mem,
+		writerProps:              writerProps,
+		arrProps:                 arrProps,
+		arrowSchema:              arrowSchema,
+		shreddingSchema:          info.VariantShreddingSchema,
+		shreddingSchemasByColumn: info.VariantShreddingSchemasByColumn,
+		shreddingPaths:           info.VariantShreddingPaths,
 	}
 
 	if !pfw.willShred() {
@@ -420,11 +429,15 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 }
 
 // willShred reports whether the writer needs to defer pqWriter creation to
-// run variant shredding. True only when either a declared shredding schema
-// or a shredding-paths list is configured AND the inbound schema has at
-// least one non-shredded variant column.
+// run variant shredding. True only when at least one shredding source —
+// per-column declared schema, table-global declared schema, or inferred
+// shredding paths — is configured AND the inbound schema has at least one
+// non-shredded variant column.
 func (w *ParquetFileWriter) willShred() bool {
-	if w.shreddingSchema.IsEmpty() && len(w.shreddingPaths) == 0 {
+	hasAnySource := !w.shreddingSchema.IsEmpty() ||
+		len(w.shreddingSchemasByColumn) > 0 ||
+		len(w.shreddingPaths) > 0
+	if !hasAnySource {
 		return false
 	}
 	for _, f := range w.arrowSchema.Fields() {
@@ -479,10 +492,15 @@ func (w *ParquetFileWriter) Write(batch arrow.RecordBatch) error {
 // rewrites arrowSchema accordingly, and opens the underlying pqarrow.FileWriter.
 // The chosen schemas are cached on w for the lifetime of the writer.
 //
-// When a declared shredding schema is configured (shreddingSchema non-empty),
-// it applies to every variant column unchanged — no per-file inference, no
-// sampling. Otherwise, the per-column layout is inferred from sample's first
-// non-null variant value.
+// Precedence per variant column:
+//  1. shreddingSchemasByColumn[<column name>] — per-column declared schema
+//     wins so a column-targeted property leaves other variant columns alone.
+//  2. shreddingSchema (table-global declared schema) — applies to every
+//     variant column not covered by (1).
+//  3. shreddingPaths — first-row inference, used only when no declared
+//     schema applies to this column.
+//
+// A column whose effective schema is empty is left non-shredded.
 func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
 	w.shredSchemas = make(map[int]ShreddingSchema)
 	fields := w.arrowSchema.Fields()
@@ -493,21 +511,9 @@ func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
 		if !isNonShreddedVariantField(f) {
 			continue
 		}
-		var (
-			schema ShreddingSchema
-			err    error
-		)
-		if !w.shreddingSchema.IsEmpty() {
-			schema = w.shreddingSchema
-		} else {
-			varr, ok := sample.Column(i).(*extensions.VariantArray)
-			if !ok {
-				continue
-			}
-			schema, err = inferColumnSchema(w.shreddingPaths, varr)
-			if err != nil {
-				return fmt.Errorf("variant shredding column %q: %w", f.Name, err)
-			}
+		schema, err := w.pickColumnSchema(f, sample.Column(i))
+		if err != nil {
+			return fmt.Errorf("variant shredding column %q: %w", f.Name, err)
 		}
 		if schema.IsEmpty() {
 			continue
@@ -530,6 +536,27 @@ func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
 	w.pqWriter = writer
 
 	return nil
+}
+
+// pickColumnSchema resolves the ShreddingSchema for one variant column,
+// applying the documented per-column → global → inferred → none precedence.
+// sampleCol may be nil/non-variant when the inference path is irrelevant.
+func (w *ParquetFileWriter) pickColumnSchema(f arrow.Field, sampleCol arrow.Array) (ShreddingSchema, error) {
+	if perCol, ok := w.shreddingSchemasByColumn[f.Name]; ok && !perCol.IsEmpty() {
+		return perCol, nil
+	}
+	if !w.shreddingSchema.IsEmpty() {
+		return w.shreddingSchema, nil
+	}
+	if len(w.shreddingPaths) == 0 {
+		return ShreddingSchema{}, nil
+	}
+	varr, ok := sampleCol.(*extensions.VariantArray)
+	if !ok {
+		return ShreddingSchema{}, nil
+	}
+
+	return inferColumnSchema(w.shreddingPaths, varr)
 }
 
 // inferColumnSchema picks a ShreddingSchema by scanning the column for the
