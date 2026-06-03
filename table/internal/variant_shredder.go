@@ -31,12 +31,33 @@ import (
 
 // WriteVariantShreddingPathsKey is the table property carrying the
 // comma-separated list of JSON-path expressions (rooted at "$") that select
-// which variant fields to shred. Matches Java's iceberg-core property name so
-// the two clients agree on the on-disk layout.
+// which variant fields to shred. The Arrow leaf type for each path is
+// inferred per file from the first non-null variant value, which is fragile
+// for heterogeneous schemas: a path absent from that one sample falls back
+// to the residual `value` column for the entire file.
 //
-// Empty (the default) means no shredding, mirroring Java's posture: never
-// shred unless explicitly configured.
+// Empty (the default) means no shredding. When both this property and
+// [WriteVariantShreddingSchemaKey] are set, the declared schema wins.
 const WriteVariantShreddingPathsKey = "write.variant.shredding-paths"
+
+// WriteVariantShreddingSchemaKey is the table property carrying a fully
+// declared shredding schema as comma-separated `<path>:<iceberg-type>`
+// entries, e.g. `$.event_type:string,$.count:long,$.src.ip:string`.
+//
+// Unlike [WriteVariantShreddingPathsKey], this skips per-file type inference
+// entirely: every file the writer produces uses the declared layout, so the
+// typed_value sub-columns and their leaf types are stable across the whole
+// table. Use this when the application already knows the schema it wants
+// shredded (e.g. a fixed event schema) and wants reliable cross-file pruning
+// and predicate pushdown.
+//
+// Supported type names follow Iceberg primitive naming: `boolean`, `int`,
+// `long`, `float`, `double`, `string`, `binary`, `date`, `timestamp`,
+// `timestamptz`. Decimal and other types can be added as needed.
+//
+// Single global property — the same declared schema applies to every variant
+// column in the table. Per-column scoping is a future extension.
+const WriteVariantShreddingSchemaKey = "write.variant.shredding-schema"
 
 // ShreddingSchema describes the typed-column layout for one variant column.
 // Build via InferShreddingSchema (paths + a sample value), or BuildShreddingSchema
@@ -84,6 +105,92 @@ func ParseShreddingPaths(spec string) ([]string, error) {
 	}
 
 	return out, nil
+}
+
+// ParseShreddingSchema parses a [WriteVariantShreddingSchemaKey] property
+// value into a fully-resolved ShreddingSchema. The format is comma-separated
+// `<path>:<iceberg-type>` entries; an empty spec returns an empty schema
+// (IsEmpty == true).
+//
+// Example:
+//
+//	$.event_type:string, $.count:long, $.src.ip:string
+//
+// Unknown type names, malformed paths, prefix conflicts (e.g. `$.a` and
+// `$.a.b`), or root `$` mixed with field paths all surface as errors so
+// misconfiguration fails fast at table-property reconcile time.
+func ParseShreddingSchema(spec string) (ShreddingSchema, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return ShreddingSchema{}, nil
+	}
+	parts := strings.Split(spec, ",")
+	paths := make([]string, 0, len(parts))
+	types := make([]arrow.DataType, 0, len(parts))
+	for _, raw := range parts {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		// Split on the LAST ':' so paths that one day allow ':' don't trip us.
+		idx := strings.LastIndex(entry, ":")
+		if idx <= 0 || idx == len(entry)-1 {
+			return ShreddingSchema{}, fmt.Errorf(
+				"variant shredding schema entry %q must be of the form '<path>:<type>'", entry)
+		}
+		path := strings.TrimSpace(entry[:idx])
+		typeName := strings.TrimSpace(entry[idx+1:])
+		dt, err := icebergTypeNameToArrow(typeName)
+		if err != nil {
+			return ShreddingSchema{}, fmt.Errorf(
+				"variant shredding schema entry %q: %w", entry, err)
+		}
+		paths = append(paths, path)
+		types = append(types, dt)
+	}
+	if len(paths) == 0 {
+		return ShreddingSchema{}, nil
+	}
+
+	return BuildShreddingSchema(paths, types)
+}
+
+// icebergTypeNameToArrow maps an Iceberg primitive type name to the Arrow
+// leaf type the Parquet shredded typed_value column should carry.
+//
+// Only types that have a meaningful variant primitive correspondence are
+// supported (the same coercion rules arrow-go's VariantBuilder applies).
+// Returning an error keeps misconfiguration from silently producing a layout
+// the writer can't actually populate.
+func icebergTypeNameToArrow(name string) (arrow.DataType, error) {
+	switch strings.ToLower(name) {
+	case "boolean", "bool":
+		return arrow.FixedWidthTypes.Boolean, nil
+	case "int8":
+		return arrow.PrimitiveTypes.Int8, nil
+	case "int16", "short":
+		return arrow.PrimitiveTypes.Int16, nil
+	case "int", "int32", "integer":
+		return arrow.PrimitiveTypes.Int32, nil
+	case "long", "int64", "bigint":
+		return arrow.PrimitiveTypes.Int64, nil
+	case "float", "float32":
+		return arrow.PrimitiveTypes.Float32, nil
+	case "double", "float64":
+		return arrow.PrimitiveTypes.Float64, nil
+	case "string", "varchar":
+		return arrow.BinaryTypes.String, nil
+	case "binary":
+		return arrow.BinaryTypes.Binary, nil
+	case "date":
+		return arrow.FixedWidthTypes.Date32, nil
+	case "timestamp":
+		return &arrow.TimestampType{Unit: arrow.Microsecond}, nil
+	case "timestamptz":
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, nil
+	default:
+		return nil, fmt.Errorf("unsupported variant shredding type %q", name)
+	}
 }
 
 // splitPath parses a JSON path like "$", "$.foo", "$.foo.bar" into its
@@ -229,6 +336,15 @@ func buildShreddedStruct(entries []shredEntry) (arrow.DataType, error) {
 // residual value column at write time.
 //
 // A nil schema (IsEmpty) is returned when no path matches the sample.
+//
+// TODO: this is a single-sample inference. Java's VariantShreddingAnalyzer
+// (parquet/.../VariantShreddingAnalyzer.java) instead walks a buffered window
+// of rows, builds a path tree, prunes paths below a frequency threshold,
+// caps the kept set, and picks the most-common type per field with integer/
+// decimal widening + tie-break priority. Porting that analyzer is the
+// follow-up that brings the inference path to parity with Java. Today,
+// callers needing stable cross-file layouts should pre-declare types via
+// WriteVariantShreddingSchemaKey instead of relying on this function.
 func InferShreddingSchema(paths []string, sample variant.Value) (ShreddingSchema, error) {
 	if len(paths) == 0 {
 		return ShreddingSchema{}, nil

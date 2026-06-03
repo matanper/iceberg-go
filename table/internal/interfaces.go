@@ -128,7 +128,16 @@ type WriteFileInfo struct {
 	// table property — the $.path expressions used to decide which variant
 	// fields are shredded into typed columns. Empty means no shredding,
 	// mirroring Java's default posture.
+	//
+	// When VariantShreddingSchema is also set (non-empty), the declared
+	// schema takes precedence and these paths are ignored.
 	VariantShreddingPaths []string
+
+	// VariantShreddingSchema is the fully-resolved shredding layout parsed
+	// from `write.variant.shredding-schema`. Non-empty means the writer
+	// applies this exact typed_value layout to every variant column in the
+	// file — no per-file type inference, no first-row dependence.
+	VariantShreddingSchema ShreddingSchema
 }
 
 type tablePropertiesContextKey struct{}

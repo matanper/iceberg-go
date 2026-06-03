@@ -66,7 +66,19 @@ const (
 	// time. Matches the same property name in iceberg-java. Empty
 	// (default) means no shredding — both clients agree the safe
 	// posture is to never shred unless explicitly configured.
+	//
+	// Leaf Arrow types are inferred per file from the first non-null
+	// variant value, which is fragile for heterogeneous schemas. Use
+	// [WriteVariantShreddingSchemaKey] when you know the layout you
+	// want and need it stable across every file in the table.
 	WriteVariantShreddingPathsKey = internal.WriteVariantShreddingPathsKey
+
+	// WriteVariantShreddingSchemaKey carries a fully declared shredding
+	// schema as comma-separated `<path>:<iceberg-type>` entries, e.g.
+	// `$.event_type:string,$.count:long,$.src.ip:string`. Skips
+	// per-file inference entirely so every file uses the same shredded
+	// layout. Takes precedence over [WriteVariantShreddingPathsKey].
+	WriteVariantShreddingSchemaKey = internal.WriteVariantShreddingSchemaKey
 
 	ManifestMergeEnabledKey     = "commit.manifest-merge.enabled"
 	ManifestMergeEnabledDefault = false

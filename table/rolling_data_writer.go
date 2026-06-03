@@ -44,18 +44,19 @@ type writerFactory struct {
 	taskSchema     *iceberg.Schema
 	targetFileSize int64
 
-	locProvider           LocationProvider
-	fileSchema            *iceberg.Schema
-	arrowSchema           *arrow.Schema
-	writeProps            any
-	variantShreddingPaths []string
-	statsCols             map[int]tblutils.StatisticsCollector
-	currentSpec           iceberg.PartitionSpec
-	fileFormat            iceberg.FileFormat
-	format                tblutils.FileFormat
-	content               iceberg.ManifestEntryContent
-	equalityFieldIDs      []int
-	sortOrderID           int
+	locProvider            LocationProvider
+	fileSchema             *iceberg.Schema
+	arrowSchema            *arrow.Schema
+	writeProps             any
+	variantShreddingPaths  []string
+	variantShreddingSchema tblutils.ShreddingSchema
+	statsCols              map[int]tblutils.StatisticsCollector
+	currentSpec            iceberg.PartitionSpec
+	fileFormat             iceberg.FileFormat
+	format                 tblutils.FileFormat
+	content                iceberg.ManifestEntryContent
+	equalityFieldIDs       []int
+	sortOrderID            int
 
 	writers               sync.Map
 	partitionLocProviders sync.Map
@@ -153,24 +154,33 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		return nil, err
 	}
 
+	shreddingSchema, err := tblutils.ParseShreddingSchema(
+		iceberg.Properties(meta.props).Get(WriteVariantShreddingSchemaKey, ""))
+	if err != nil {
+		stopCount()
+
+		return nil, err
+	}
+
 	f := &writerFactory{
-		rootLocation:          rootLocation,
-		rootURL:               rootURL,
-		fs:                    args.fs,
-		writeUUID:             args.writeUUID,
-		taskSchema:            taskSchema,
-		targetFileSize:        targetFileSize,
-		locProvider:           locProvider,
-		fileSchema:            fileSchema,
-		arrowSchema:           arrowSchema,
-		writeProps:            format.GetWriteProperties(meta.props),
-		variantShreddingPaths: shreddingPaths,
-		currentSpec:           *currentSpec,
-		fileFormat:            fileFormat,
-		format:                format,
-		nextCount:             nextCount,
-		stopCount:             stopCount,
-		sortOrderID:           meta.defaultSortOrderID,
+		rootLocation:           rootLocation,
+		rootURL:                rootURL,
+		fs:                     args.fs,
+		writeUUID:              args.writeUUID,
+		taskSchema:             taskSchema,
+		targetFileSize:         targetFileSize,
+		locProvider:            locProvider,
+		fileSchema:             fileSchema,
+		arrowSchema:            arrowSchema,
+		writeProps:             format.GetWriteProperties(meta.props),
+		variantShreddingPaths:  shreddingPaths,
+		variantShreddingSchema: shreddingSchema,
+		currentSpec:            *currentSpec,
+		fileFormat:             fileFormat,
+		format:                 format,
+		nextCount:              nextCount,
+		stopCount:              stopCount,
+		sortOrderID:            meta.defaultSortOrderID,
 	}
 	for _, apply := range opts {
 		apply(f)
@@ -212,15 +222,16 @@ func (w *writerFactory) openFileWriter(ctx context.Context, partitionPath string
 	}
 
 	return w.format.NewFileWriter(ctx, w.fs, partitionValues, tblutils.WriteFileInfo{
-		FileSchema:            w.fileSchema,
-		FileName:              filePath,
-		StatsCols:             w.statsCols,
-		WriteProps:            w.writeProps,
-		Spec:                  w.currentSpec,
-		Content:               w.content,
-		EqualityFieldIDs:      w.equalityFieldIDs,
-		SortOrderID:           w.sortOrderID,
-		VariantShreddingPaths: w.variantShreddingPaths,
+		FileSchema:             w.fileSchema,
+		FileName:               filePath,
+		StatsCols:              w.statsCols,
+		WriteProps:             w.writeProps,
+		Spec:                   w.currentSpec,
+		Content:                w.content,
+		EqualityFieldIDs:       w.equalityFieldIDs,
+		SortOrderID:            w.sortOrderID,
+		VariantShreddingPaths:  w.variantShreddingPaths,
+		VariantShreddingSchema: w.variantShreddingSchema,
 	}, w.arrowSchema)
 }
 

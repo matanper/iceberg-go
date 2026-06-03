@@ -328,11 +328,12 @@ func (p parquetFormat) WriteDataFile(ctx context.Context, fs iceio.WriteFileIO, 
 // lifecycle. It writes Arrow record batches to a Parquet file and tracks bytes
 // written for rolling file decisions.
 //
-// When VariantShreddingPaths is set on info and the schema has variant
-// columns, opening the underlying pqarrow.FileWriter is deferred until the
-// first Write call: the leaf Arrow types for each shredded path are inferred
-// from that batch's first non-null variant value, then the writer is opened
-// against the rewritten schema.
+// When VariantShreddingSchema or VariantShreddingPaths is set on info and the
+// schema has variant columns, opening the underlying pqarrow.FileWriter is
+// deferred until the first Write call. With a declared schema the layout is
+// known up front; with paths-only the leaf Arrow types are inferred from the
+// first non-null variant value in the first batch. Either way the rewritten
+// arrow schema is what pqarrow.FileWriter is opened against.
 type ParquetFileWriter struct {
 	counter    *internal.CountingWriter
 	fileCloser io.Closer
@@ -351,8 +352,14 @@ type ParquetFileWriter struct {
 	// from a sample batch.
 	pqWriter *pqarrow.FileWriter
 
+	// shreddingSchema is the declared schema parsed from
+	// write.variant.shredding-schema. When non-empty, applies to every
+	// variant column in the file and pre-empts shreddingPaths.
+	shreddingSchema ShreddingSchema
+
 	// shreddingPaths is the parsed property; non-empty means we may need
-	// to shred one or more variant columns in this file.
+	// to shred one or more variant columns in this file using first-row
+	// inference. Ignored when shreddingSchema is non-empty.
 	shreddingPaths []string
 
 	// shredSchemas is keyed by variant column index in arrowSchema. Once a
@@ -385,17 +392,18 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithAllocator(mem), pqarrow.WithStoreSchema())
 
 	pfw := &ParquetFileWriter{
-		counter:        counter,
-		fileCloser:     fw,
-		format:         p,
-		info:           info,
-		partition:      partitionValues,
-		colMapping:     colMapping,
-		mem:            mem,
-		writerProps:    writerProps,
-		arrProps:       arrProps,
-		arrowSchema:    arrowSchema,
-		shreddingPaths: info.VariantShreddingPaths,
+		counter:         counter,
+		fileCloser:      fw,
+		format:          p,
+		info:            info,
+		partition:       partitionValues,
+		colMapping:      colMapping,
+		mem:             mem,
+		writerProps:     writerProps,
+		arrProps:        arrProps,
+		arrowSchema:     arrowSchema,
+		shreddingSchema: info.VariantShreddingSchema,
+		shreddingPaths:  info.VariantShreddingPaths,
 	}
 
 	if !pfw.willShred() {
@@ -412,10 +420,11 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 }
 
 // willShred reports whether the writer needs to defer pqWriter creation to
-// run variant shredding. True only when shredding paths are configured AND
-// the inbound schema has at least one non-shredded variant column.
+// run variant shredding. True only when either a declared shredding schema
+// or a shredding-paths list is configured AND the inbound schema has at
+// least one non-shredded variant column.
 func (w *ParquetFileWriter) willShred() bool {
-	if len(w.shreddingPaths) == 0 {
+	if w.shreddingSchema.IsEmpty() && len(w.shreddingPaths) == 0 {
 		return false
 	}
 	for _, f := range w.arrowSchema.Fields() {
@@ -466,10 +475,14 @@ func (w *ParquetFileWriter) Write(batch arrow.RecordBatch) error {
 	return w.pqWriter.WriteBuffered(shredded)
 }
 
-// openWithShredding inspects sample to infer typed_value layouts for each
-// variant column, rewrites arrowSchema accordingly, and opens the underlying
-// pqarrow.FileWriter. The inferred schemas are cached on w for the lifetime
-// of the writer.
+// openWithShredding picks a typed_value layout for each variant column,
+// rewrites arrowSchema accordingly, and opens the underlying pqarrow.FileWriter.
+// The chosen schemas are cached on w for the lifetime of the writer.
+//
+// When a declared shredding schema is configured (shreddingSchema non-empty),
+// it applies to every variant column unchanged — no per-file inference, no
+// sampling. Otherwise, the per-column layout is inferred from sample's first
+// non-null variant value.
 func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
 	w.shredSchemas = make(map[int]ShreddingSchema)
 	fields := w.arrowSchema.Fields()
@@ -480,13 +493,21 @@ func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
 		if !isNonShreddedVariantField(f) {
 			continue
 		}
-		varr, ok := sample.Column(i).(*extensions.VariantArray)
-		if !ok {
-			continue
-		}
-		schema, err := inferColumnSchema(w.shreddingPaths, varr)
-		if err != nil {
-			return fmt.Errorf("variant shredding column %q: %w", f.Name, err)
+		var (
+			schema ShreddingSchema
+			err    error
+		)
+		if !w.shreddingSchema.IsEmpty() {
+			schema = w.shreddingSchema
+		} else {
+			varr, ok := sample.Column(i).(*extensions.VariantArray)
+			if !ok {
+				continue
+			}
+			schema, err = inferColumnSchema(w.shreddingPaths, varr)
+			if err != nil {
+				return fmt.Errorf("variant shredding column %q: %w", f.Name, err)
+			}
 		}
 		if schema.IsEmpty() {
 			continue
@@ -515,6 +536,17 @@ func (w *ParquetFileWriter) openWithShredding(sample arrow.RecordBatch) error {
 // first non-null variant value and inferring leaf Arrow types from it.
 // Returns an empty schema (no shredding for this column) when the column has
 // no inferable values.
+//
+// TODO: this single-row inference is much weaker than what iceberg-java does
+// for the same property. Java's VariantShreddingAnalyzer (parquet/.../
+// VariantShreddingAnalyzer.java) buffers a window of rows
+// (write.parquet.variant-inference-buffer-size, default 100), builds a path
+// tree across all observed values, prunes paths below 10% frequency, caps the
+// kept set at 300 fields, and picks the most-common observed type per field
+// with explicit integer/decimal widening and tie-break priority. Porting that
+// algorithm here is the right way to match Java's posture for the inference
+// path. Until then, callers who need stable, cross-file-consistent shredding
+// should declare types up front via WriteVariantShreddingSchemaKey instead.
 func inferColumnSchema(paths []string, arr *extensions.VariantArray) (ShreddingSchema, error) {
 	for i := 0; i < arr.Len(); i++ {
 		if arr.IsNull(i) {
